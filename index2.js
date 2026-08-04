@@ -1,3 +1,14 @@
+const http = require('http');
+
+// Поднимаем фейковый веб-сервер для Render
+const port = process.env.PORT || 10000;
+http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Kaban Financier is alive!');
+}).listen(port, () => {
+  console.log(`Server is listening on port ${port}`);
+});
+
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
