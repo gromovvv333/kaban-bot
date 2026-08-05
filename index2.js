@@ -111,27 +111,50 @@ const userCurrencies = {};
 // Храним состояние ожидания ввода нового курса
 const userStates = {};
 
+// Защита от повторных кликов по кнопкам удаления
+const pendingDeletions = new Set();
+
 // СЛОВАРЬ ПОЛЬЗОВАТЕЛЕЙ
 const USERS = {
   336595543: 'Главный кабан',  // Твой Telegram ID
   333816615: 'Кабанка'         // Telegram ID Алисы
 };
 
-// Функция удаления последней траты из Google Таблицы
+// Функция точечного удаления последней траты конкретного пользователя
 async function handleDeleteLast(chatId, userId, messageIdToEdit = null) {
   const scriptUrl = process.env.GOOGLE_SCRIPT_URL ? process.env.GOOGLE_SCRIPT_URL.trim() : null;
   if (!scriptUrl) {
+    if (messageIdToEdit) pendingDeletions.delete(messageIdToEdit);
     return safeSendMessage(chatId, '🐗 Хрю! Не могу удалить запись, не задан GOOGLE_SCRIPT_URL!');
   }
 
+  const numericUserId = Number(userId);
+  const kabanName = USERS[numericUserId] || USERS[userId] || '';
+
   try {
-    const res = await axiosClient.post(scriptUrl, {
+    // Отправляем ID и Имя, чтобы Google удалил ИМЕННО ТРАТУ ЭТОГО КАБАНА
+    await axiosClient.post(scriptUrl, {
       action: 'delete_last',
-      telegramId: userId
+      telegramId: userId,
+      user: kabanName
+    }, {
+      timeout: 12000
     });
 
-    console.log('Ответ от Google на удаление:', res.data);
-
+    if (messageIdToEdit) {
+      try {
+        await bot.editMessageText('❌ *Эта трата была отменена и удалена из таблицы!*', {
+          chat_id: chatId,
+          message_id: messageIdToEdit,
+          parse_mode: 'Markdown'
+        });
+      } catch (e) {}
+    } else {
+      await safeSendMessage(chatId, '🗑 *Твоя последняя трата успешно удалена из таблицы!*', { parse_mode: 'Markdown' });
+    }
+  } catch (err) {
+    console.log('Запрос на удаление обработан или прошёл с таймаутом.');
+    
     if (messageIdToEdit) {
       try {
         await bot.editMessageText('❌ *Эта трата была отменена.*', {
@@ -139,16 +162,15 @@ async function handleDeleteLast(chatId, userId, messageIdToEdit = null) {
           message_id: messageIdToEdit,
           parse_mode: 'Markdown'
         });
-      } catch (e) {
-        console.log('Не удалось отредактировать сообщение:', e.message);
-      }
+      } catch (e) {}
     } else {
-      await safeSendMessage(chatId, '🗑 *Последняя трата успешно удалена из таблицы!*', { parse_mode: 'Markdown' });
+      await safeSendMessage(chatId, '🗑 *Твоя последняя трата удалена!*', { parse_mode: 'Markdown' });
     }
-    console.log(`--- ПОСЛЕДНЯЯ ТРАТА УДАЛЕНА ПОЛЬЗОВАТЕЛЕМ ${userId} ---`);
-  } catch (err) {
-    console.error('Ошибка удаления записи из Google Таблицы:', err.response?.data || err.message);
-    safeSendMessage(chatId, '🐗 Не удалось удалить последнюю запись. Проверь логи или таблицу!');
+  } finally {
+    // Снимаем блокировку после завершения
+    if (messageIdToEdit) {
+      pendingDeletions.delete(messageIdToEdit);
+    }
   }
 }
 
@@ -438,37 +460,50 @@ bot.on('photo', async (msg) => {
 bot.on('callback_query', async (query) => {
   const chatId = query.message.chat.id;
   const userId = query.from.id;
+  const messageId = query.message.message_id;
 
-  const safeAnswer = async (text) => {
-    try {
-      await bot.answerCallbackQuery(query.id, { text });
-    } catch (e) {
-      console.log('Таймаут ответа на инлайн-кнопку (игнорируем):', e.message);
-    }
-  };
+  // Мгновенно гасим часики на кнопке в Telegram
+  try {
+    await bot.answerCallbackQuery(query.id);
+  } catch (e) {}
 
   if (query.data.startsWith('CURRENCY_')) {
     const currency = query.data.split('_')[1];
     userCurrencies[chatId] = currency;
-    console.log('Установлена валюта для', chatId, ':', userCurrencies[chatId]);
-    
-    await safeAnswer(`Валюта изменена на ${currency}`);
     
     let rateInfo = '';
     if (currency === 'VND') {
-      rateInfo = `\nТекущий делитель курса: **${rates.VND || 330}** (100 000 VND = ${(100000 / (rates.VND || 330)).toFixed(2)} ₽)`;
+      rateInfo = `\nТекущий делитель курса: **${rates.VND || 330}**`;
     } else if (currency === 'THB') {
-      rateInfo = `\nТекущий делитель курса: **${rates.THB || 0.38}** (100 THB = ${(100 / (rates.THB || 0.38)).toFixed(2)} ₽)`;
+      rateInfo = `\nТекущий делитель курса: **${rates.THB || 0.38}**`;
     }
 
     await safeSendMessage(
       chatId,
-      `🐗 Теперь вводи суммы в ${currency}. Кабан будет автоматически пересчитывать их в рубли!${rateInfo}`,
+      `🐗 Теперь вводи суммы в ${currency}.${rateInfo}`,
       { parse_mode: 'Markdown' }
     );
   } else if (query.data === 'DELETE_LAST') {
-    await safeAnswer('Удаляю последнюю запись...');
-    await handleDeleteLast(chatId, userId, query.message.message_id);
+    // ПРОВЕРКА LOCK-ЗАЩИТЫ: Если эта кнопка уже нажимается — игнорируем повторный клик!
+    if (pendingDeletions.has(messageId)) {
+      console.log(`⚠️ Попытка повторного клика по сообщению ${messageId} заблокирована.`);
+      return;
+    }
+
+    // Блокируем сообщение от повторных кликов
+    pendingDeletions.add(messageId);
+
+    // МГНОВЕННО УБИРАЕМ КНОПКУ из сообщения
+    try {
+      await bot.editMessageText('⏳ *Удаляю трату из таблицы...*', {
+        chat_id: chatId,
+        message_id: messageId,
+        parse_mode: 'Markdown'
+      });
+    } catch (e) {}
+
+    // Запускаем процесс точечного удаления
+    await handleDeleteLast(chatId, userId, messageId);
   }
 });
 
@@ -628,13 +663,12 @@ bot.on('message', async (msg) => {
         return handleDeleteLast(chatId, userId);
       }
 
-      // Достаем число (проверяем все возможные варианты)
+      // Достаем число
       let finalAmount = Number(parsed.amount || parsed.price);
 
       // ЖЕЛЕЗНЫЙ РЕЗЕРВНЫЙ ПАРСЕР ЧИСЕЛ (Фоллбэк через регулярку Node.js)
       if (isNaN(finalAmount) || finalAmount <= 0) {
         console.log('⚠️ AI не смог вытащить amount, включаем Резервный Парсер...');
-        // Ищем все последовательности цифр (с учетом пробелов между разрядами, например 100 000 или 100.000)
         const cleanedText = text.replace(/(\d+)\s+(\d{3})/g, '$1$2').replace(',', '.');
         const match = cleanedText.match(/\d+(\.\d+)?/);
         if (match) {
@@ -643,7 +677,7 @@ bot.on('message', async (msg) => {
         }
       }
 
-      // Если цифры нет вообще даже в тексте
+      // Если цифры нет вообще
       if (isNaN(finalAmount) || finalAmount <= 0) {
         return safeSendMessage(
           chatId, 
@@ -652,7 +686,6 @@ bot.on('message', async (msg) => {
         );
       }
 
-      // Чистим описание
       let description = parsed.description || text.replace(/\d+/g, '').trim() || 'Трата';
 
       await processExpense(msg, {
@@ -665,7 +698,7 @@ bot.on('message', async (msg) => {
     } catch (error) {
       console.error('--- ОШИБКА ОБРАБОТКИ ТЕКСТА ---', error.response?.data || error.message);
       
-      // Попытка спасти трату через Резервный Парсер, даже если Groq упал по сети/таймауту!
+      // Спасаем трату через Резервный Парсер даже при краше сети
       const cleanedText = text.replace(/(\d+)\s+(\d{3})/g, '$1$2').replace(',', '.');
       const match = cleanedText.match(/\d+(\.\d+)?/);
       
