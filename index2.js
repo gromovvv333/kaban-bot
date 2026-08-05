@@ -96,7 +96,6 @@ async function safeSendMessage(chatId, text, options = {}, retries = 3) {
         console.log(`⚠️ Сетевой сбой при отправке (попытка ${i + 1}/${retries}), повтор через 1 сек...`);
         await new Promise((res) => setTimeout(res, 1000));
       } else if (err.message && err.message.includes('PARSE_MODE') && options.parse_mode) {
-        // Если упал Markdown-партинг — отправляем без форматирования
         delete options.parse_mode;
         return await bot.sendMessage(chatId, text, options);
       } else {
@@ -563,20 +562,42 @@ bot.on('message', async (msg) => {
     return handleDeleteLast(chatId, userId);
   }
 
-  // 6. Обычный ввод траты
+  // 6. Обычный ввод траты или команда
   if (!text.startsWith('/')) {
     try {
-      console.log(`Обрабатываем сообщение: "${text}"`);
+      console.log(`[ТЕКСТ ВХОД]: "${text}"`);
       const groqKey = process.env.GROQ_API_KEY ? process.env.GROQ_API_KEY.trim() : '';
 
-      const intentResponse = await axiosClient.post(
+      // Единый AI-запрос
+      const singleAiResponse = await axiosClient.post(
         '[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)',
         {
           model: 'llama-3.3-70b-versatile',
           messages: [
             {
               role: 'system',
-              content: 'Проанализий текст. Если пользователь хочет УДАЛИТЬ или ОТМЕНИТЬ последнюю трату (например: "отмени", "удали", "ошибка"), верни JSON: {"intent": "delete"}. Если вводит НОВУЮ ТРАТУ (например: "Пиво 300", "Такси 450 личный", "100000 фо бо"), верни JSON: {"intent": "add_expense"}. Если ЗАДАЕТ ВОПРОС, просит аналитику или статистику, верни JSON: {"intent": "analytics"}. Верни ТОЛЬКО JSON.'
+              content: `Ты — умный модуль распознавания финансовых трат.
+Разбери сообщение пользователя и верни СТРОГО JSON-объект без пояснений.
+
+ФОРМАТ JSON:
+{
+  "intent": "add_expense" | "delete" | "analytics",
+  "amount": число_или_null,
+  "category": "Категория",
+  "description": "Описание траты на русском",
+  "type": "Общий" | "Личный"
+}
+
+ПРАВИЛА ОПРЕДЕЛЕНИЯ ИНТЕНТА:
+- "delete": если просит отменить/удалить (например: "удали", "отмени", "ошибка", "убери").
+- "analytics": если просит статистику/анализ/вопрос по деньгам (например: "сколько потратили", "анализ", "отчет").
+- "add_expense": во всех остальных случаях (ввод траты).
+
+ПРАВИЛА ИЗВЛЕЧЕНИЯ ДАННЫХ ДЛЯ add_expense:
+1. amount: Извлеки чистое число траты. Пробелы в тысячах (например 100 000) или точки (100.000) превращай в обычное число 100000.
+2. category: Одна из: Продукты, Бухло, Вкусняшки кабаньи, Транспорт, Жилье и Коммуналка, Развлечения и Отдых, Здоровье и Аптека, Покупки и Шмотки, Кафе и Рестораны, Подарки и Донаты.
+3. type: "Личный" (если есть "себе", "мне", "личный", или шмотки/аптека) иначе "Общий".
+4. description: Короткое понятное название на русском.`
             },
             { role: 'user', content: text }
           ],
@@ -586,81 +607,80 @@ bot.on('message', async (msg) => {
           headers: {
             'Authorization': `Bearer ${groqKey}`,
             'Content-Type': 'application/json'
-          }
+          },
+          timeout: 15000
         }
       );
 
-      const intentData = JSON.parse(intentResponse.data.choices[0].message.content);
-
-      if (intentData.intent === 'analytics') {
-        return handleAnalytics(msg);
+      let parsed = {};
+      try {
+        parsed = JSON.parse(singleAiResponse.data.choices[0].message.content);
+        console.log('[AI РЕЗУЛЬТАТ]:', parsed);
+      } catch (e) {
+        console.error('Ошибка парсинга JSON от Groq:', e.message);
       }
 
-      if (intentData.intent === 'delete') {
+      // Перенаправление интентов
+      if (parsed.intent === 'analytics') {
+        return handleAnalytics(msg);
+      }
+      if (parsed.intent === 'delete') {
         return handleDeleteLast(chatId, userId);
       }
 
-      const parseResponse = await axiosClient.post(
-        '[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)',
-        {
-          model: 'llama-3.3-70b-versatile',
-          messages: [
-            {
-              role: 'system',
-              content: `Ты — ассистент по учету финансов. Распознай сумму, описание, категорию и ТИП ТРАТЫ ("Общий" или "Личный") из текста.
+      // Достаем число (проверяем все возможные варианты)
+      let finalAmount = Number(parsed.amount || parsed.price);
 
-ПРАВИЛА ОПРЕДЕЛЕНИЯ ТИПА ("type"):
-1. ЯВНЫЕ СЛОВА: Если есть слова "личный", "себе", "моё", "мне", "для меня" -> type: "Личный". Если есть слова "наш", "нам", "домой", "общий" -> type: "Общий".
-2. ЛОГИКА ПО КАТЕГОРИЯМ (если нет явных слов):
-   - "Покупки и Шмотки", "Здоровье и Аптека", "Подарки и Донаты" -> по умолчанию "Личный".
-   - "Жилье и Коммуналка", "Продукты", "Кафе и Рестораны", "Развлечения и Отдых", "Транспорт", "Вкусняшки кабаньи", "Бухло" -> по умолчанию "Общий".
-
-ПРАВИЛА КАТЕГОРИЗАЦИИ:
-- "Кафе и Рестораны": ЛЮБАЯ готовая еда и напитки, фастфуд, стритфуд, кофе, заведения.
-- "Продукты": ТОЛЬКО супермаркеты и сырые ингредиенты из магазина.
-- "Бухло": ТОЛЬКО алкогольные напитки.
-- "Вкусняшки кабаньи": Сладкое, чипсы, мороженое, десерты, снэки.
-- "Транспорт": Такси, бензин, проезд, байк, аренда авто, метро, граб.
-- "Жилье и Коммуналка": Отель, аренда, коммуналка, интернет, жилье.
-- "Развлечения и Отдых": Билеты, кино, экскурсии, массаж, игры, парки.
-- "Здоровье и Аптека": Лекарства, аптека, врачи, анализы.
-- "Покупки и Шмотки": Одежда, обувь, техника, хозяйственные товары.
-- "Подарки и Донаты": Подарки, чаевые, донаты.
-
-ПРАВИЛА ПАРСИНГА:
-1. Число из текста ВСЕГДА извлекается как amount.
-2. Описание переводи на русский и нормализуй (например, "фо бо 100000" -> description: "Фо бо").
-
-Верни ТОЛЬКО JSON вида: {"amount": число, "category": "строка", "description": "строка", "type": "Общий" или "Личный"}`
-            },
-            { role: 'user', content: text }
-          ],
-          response_format: { type: 'json_object' }
-        },
-        {
-          headers: {
-            'Authorization': `Bearer ${groqKey}`,
-            'Content-Type': 'application/json'
-          }
+      // ЖЕЛЕЗНЫЙ РЕЗЕРВНЫЙ ПАРСЕР ЧИСЕЛ (Фоллбэк через регулярку Node.js)
+      if (isNaN(finalAmount) || finalAmount <= 0) {
+        console.log('⚠️ AI не смог вытащить amount, включаем Резервный Парсер...');
+        // Ищем все последовательности цифр (с учетом пробелов между разрядами, например 100 000 или 100.000)
+        const cleanedText = text.replace(/(\d+)\s+(\d{3})/g, '$1$2').replace(',', '.');
+        const match = cleanedText.match(/\d+(\.\d+)?/);
+        if (match) {
+          finalAmount = parseFloat(match[0]);
+          console.log(`[РЕЗЕРВНЫЙ ПАРСЕР УСПЕХ]: извлечено число ${finalAmount}`);
         }
-      );
-
-      const parsed = JSON.parse(parseResponse.data.choices[0].message.content);
-
-      if (!parsed.amount || isNaN(Number(parsed.amount))) {
-        return safeSendMessage(chatId, '🐗 Кабан не нашёл сумму в сообщении. Напиши, например: `Такси 300` или `50000 фо бо`.', { parse_mode: 'Markdown' });
       }
 
+      // Если цифры нет вообще даже в тексте
+      if (isNaN(finalAmount) || finalAmount <= 0) {
+        return safeSendMessage(
+          chatId, 
+          '🐗 Кабан не нашёл сумму в сообщении. Напиши цифрами, например: `Такси 300` или `50000 фо бо`.', 
+          { parse_mode: 'Markdown' }
+        );
+      }
+
+      // Чистим описание
+      let description = parsed.description || text.replace(/\d+/g, '').trim() || 'Трата';
+
       await processExpense(msg, {
-        amount: parsed.amount,
-        category: parsed.category,
-        description: parsed.description,
+        amount: finalAmount,
+        category: parsed.category || 'Продукты',
+        description: description,
         type: parsed.type || 'Общий'
       });
 
     } catch (error) {
-      console.error('--- ОШИБКА ОБРАБОТКИ ---', error.response?.data || error.message);
-      safeSendMessage(chatId, '🐗 Упс! Кабан запутался в цифрах и хрюкнул. Попробуй еще раз!');
+      console.error('--- ОШИБКА ОБРАБОТКИ ТЕКСТА ---', error.response?.data || error.message);
+      
+      // Попытка спасти трату через Резервный Парсер, даже если Groq упал по сети/таймауту!
+      const cleanedText = text.replace(/(\d+)\s+(\d{3})/g, '$1$2').replace(',', '.');
+      const match = cleanedText.match(/\d+(\.\d+)?/);
+      
+      if (match) {
+        const fallbackAmount = parseFloat(match[0]);
+        console.log(`[CRASH FALLBACK SUCCESS]: Вытащили ${fallbackAmount} без участия AI`);
+        return await processExpense(msg, {
+          amount: fallbackAmount,
+          category: 'Продукты',
+          description: text.replace(/\d+/g, '').trim() || 'Трата',
+          type: 'Общий'
+        });
+      }
+
+      safeSendMessage(chatId, '🐗 Упс! Не смог найти сумму. Напиши, например: `Такси 300`.');
     }
   }
 });
@@ -680,5 +700,3 @@ process.on('unhandledRejection', (reason) => {
 });
 
 console.log('Бот "Кабан Финансист" успешно запущен и готов к деплою!');
-
-
