@@ -120,11 +120,11 @@ const USERS = {
   333816615: 'Кабанка'         // Telegram ID Алисы
 };
 
-// Функция точечного удаления последней траты конкретного пользователя
-async function handleDeleteLast(chatId, userId, messageIdToEdit = null) {
+// Функция точечного удаления конкретной траты (или последней из меню)
+async function handleDeleteExpense(chatId, userId, messageIdToDelete = null) {
   const scriptUrl = process.env.GOOGLE_SCRIPT_URL ? process.env.GOOGLE_SCRIPT_URL.trim() : null;
   if (!scriptUrl) {
-    if (messageIdToEdit) pendingDeletions.delete(messageIdToEdit);
+    if (messageIdToDelete) pendingDeletions.delete(messageIdToDelete);
     return safeSendMessage(chatId, '🐗 Хрю! Не могу удалить запись, не задан GOOGLE_SCRIPT_URL!');
   }
 
@@ -133,18 +133,19 @@ async function handleDeleteLast(chatId, userId, messageIdToEdit = null) {
 
   try {
     await axiosClient.post(scriptUrl, {
-      action: 'delete_last',
+      action: messageIdToDelete ? 'delete_by_id' : 'delete_last',
       telegramId: userId,
-      user: kabanName
+      user: kabanName,
+      messageId: messageIdToDelete
     }, {
       timeout: 12000
     });
 
-    if (messageIdToEdit) {
+    if (messageIdToDelete) {
       try {
-        await bot.editMessageText('❌ *Эта трата была отменена и удалена из таблицы!*', {
+        await bot.editMessageText('❌ *Эта конкретная трата была отменена и удалена из таблицы!*', {
           chat_id: chatId,
-          message_id: messageIdToEdit,
+          message_id: messageIdToDelete,
           parse_mode: 'Markdown'
         });
       } catch (e) {}
@@ -154,11 +155,11 @@ async function handleDeleteLast(chatId, userId, messageIdToEdit = null) {
   } catch (err) {
     console.log('Запрос на удаление обработан или прошёл с таймаутом.');
     
-    if (messageIdToEdit) {
+    if (messageIdToDelete) {
       try {
-        await bot.editMessageText('❌ *Эта трата была отменена.*', {
+        await bot.editMessageText('❌ *Эта конкретная трата отменена.*', {
           chat_id: chatId,
-          message_id: messageIdToEdit,
+          message_id: messageIdToDelete,
           parse_mode: 'Markdown'
         });
       } catch (e) {}
@@ -166,8 +167,8 @@ async function handleDeleteLast(chatId, userId, messageIdToEdit = null) {
       await safeSendMessage(chatId, '🗑 *Твоя последняя трата удалена!*', { parse_mode: 'Markdown' });
     }
   } finally {
-    if (messageIdToEdit) {
-      pendingDeletions.delete(messageIdToEdit);
+    if (messageIdToDelete) {
+      pendingDeletions.delete(messageIdToDelete);
     }
   }
 }
@@ -209,7 +210,7 @@ async function processExpense(msg, data) {
   let greetingHeader = '';
   if (kabanName === 'Главный кабан') {
     const headers = [
-      '🐗🫡 *Служу Главому Кабану! Трата зафиксирована!*',
+      '🐗🫡 *Служу Главному Кабану! Трата зафиксирована!*',
       '🐗🫡 *Слушаюсь, Дон Кабаньоне! Желуди сосчитаны!*',
       '🐗🫡 *Вожак Стада, трата занесена в реестр!*'
     ];
@@ -233,17 +234,25 @@ async function processExpense(msg, data) {
     `🏷 *Тип:* ${data.type || 'Общий'}\n\n` +
     `📊 _Зарубил на носу и отправляю в дубраву (таблицу)!_`;
 
-  const options = {
-    parse_mode: 'Markdown',
-    reply_markup: {
+  // 1. Отправляем сообщение без кнопки, чтобы узнать его message_id
+  const sentMsg = await safeSendMessage(chatId, textMessage, { parse_mode: 'Markdown' });
+  if (!sentMsg) return;
+
+  const sentMessageId = sentMsg.message_id;
+
+  // 2. Добавляем инлайн-кнопку с привязанным к ней message_id
+  try {
+    await bot.editMessageReplyMarkup({
       inline_keyboard: [
-        [{ text: '🗑 Отменить эту трату', callback_data: 'DELETE_LAST' }]
+        [{ text: '🗑 Отменить эту трату', callback_data: `DELETE_MSG_${sentMessageId}` }]
       ]
-    }
-  };
+    }, {
+      chat_id: chatId,
+      message_id: sentMessageId
+    });
+  } catch (e) {}
 
-  await safeSendMessage(chatId, textMessage, options);
-
+  // 3. Отправляем в Google Таблицу данные вместе с messageId (в столбец H)
   const scriptUrl = process.env.GOOGLE_SCRIPT_URL ? process.env.GOOGLE_SCRIPT_URL.trim() : null;
   if (scriptUrl && scriptUrl.startsWith('http')) {
     try {
@@ -254,7 +263,8 @@ async function processExpense(msg, data) {
         amountRub: amountRub,
         category: data.category,
         name: data.description || '',
-        type: data.type || 'Общий'
+        type: data.type || 'Общий',
+        messageId: sentMessageId
       };
 
       const response = await axiosClient.post(scriptUrl, payload);
@@ -458,7 +468,6 @@ bot.on('photo', async (msg) => {
 bot.on('callback_query', async (query) => {
   const chatId = query.message.chat.id;
   const userId = query.from.id;
-  const messageId = query.message.message_id;
 
   try {
     await bot.answerCallbackQuery(query.id);
@@ -480,23 +489,27 @@ bot.on('callback_query', async (query) => {
       `🐗 Теперь вводи суммы в ${currency}.${rateInfo}`,
       { parse_mode: 'Markdown' }
     );
-  } else if (query.data === 'DELETE_LAST') {
-    if (pendingDeletions.has(messageId)) {
-      console.log(`⚠️ Попытка повторного клика по сообщению ${messageId} заблокирована.`);
+  } else if (query.data.startsWith('DELETE_MSG_')) {
+    const targetMsgId = Number(query.data.split('_')[2]);
+
+    if (pendingDeletions.has(targetMsgId)) {
+      console.log(`⚠️ Попытка повторного клика по сообщению ${targetMsgId} заблокирована.`);
       return;
     }
 
-    pendingDeletions.add(messageId);
+    pendingDeletions.add(targetMsgId);
 
     try {
       await bot.editMessageText('⏳ *Удаляю трату из таблицы...*', {
         chat_id: chatId,
-        message_id: messageId,
+        message_id: targetMsgId,
         parse_mode: 'Markdown'
       });
     } catch (e) {}
 
-    await handleDeleteLast(chatId, userId, messageId);
+    await handleDeleteExpense(chatId, userId, targetMsgId);
+  } else if (query.data === 'DELETE_LAST') {
+    await handleDeleteExpense(chatId, userId, null);
   }
 });
 
@@ -587,7 +600,7 @@ bot.on('message', async (msg) => {
 
   // 5. Кнопка и команда «Удалить последнюю»
   if (text === '🗑 Удалить последнюю' || text === '/delete' || text === '/undo') {
-    return handleDeleteLast(chatId, userId);
+    return handleDeleteExpense(chatId, userId, null);
   }
 
   // 6. Обычный ввод трат (одновременно одной или нескольких)
@@ -651,7 +664,7 @@ bot.on('message', async (msg) => {
         return handleAnalytics(msg);
       }
       if (parsed.intent === 'delete') {
-        return handleDeleteLast(chatId, userId);
+        return handleDeleteExpense(chatId, userId, null);
       }
 
       // Извлекаем массив трат
