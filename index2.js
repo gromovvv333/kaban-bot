@@ -95,6 +95,10 @@ async function safeSendMessage(chatId, text, options = {}, retries = 3) {
       if ((err.code === 'EFATAL' || err.code === 'ETIMEDOUT') && i < retries - 1) {
         console.log(`⚠️ Сетевой сбой при отправке (попытка ${i + 1}/${retries}), повтор через 1 сек...`);
         await new Promise((res) => setTimeout(res, 1000));
+      } else if (err.message && err.message.includes('PARSE_MODE') && options.parse_mode) {
+        // Если упал Markdown-партинг — отправляем без форматирования
+        delete options.parse_mode;
+        return await bot.sendMessage(chatId, text, options);
       } else {
         throw err;
       }
@@ -260,6 +264,7 @@ async function handleAnalytics(msg) {
     const tableDataResponse = await axiosClient.get(scriptUrl);
     const historyData = tableDataResponse.data;
 
+    const groqKey = process.env.GROQ_API_KEY ? process.env.GROQ_API_KEY.trim() : '';
     const analyticsAiResponse = await axiosClient.post(
       'https://api.groq.com/openai/v1/chat/completions',
       {
@@ -295,7 +300,7 @@ async function handleAnalytics(msg) {
       },
       {
         headers: {
-          'Authorization': `Bearer ${process.env.GROQ_API_KEY.trim()}`,
+          'Authorization': `Bearer ${groqKey}`,
           'Content-Type': 'application/json'
         }
       }
@@ -331,6 +336,7 @@ bot.on('photo', async (msg) => {
     const base64Image = Buffer.from(imageResponse.data, 'binary').toString('base64');
     const captionText = msg.caption ? `Подпись от пользователя к фото: "${msg.caption}"` : 'Подписи нет.';
 
+    const groqKey = process.env.GROQ_API_KEY ? process.env.GROQ_API_KEY.trim() : '';
     const visionResponse = await axiosClient.post(
       'https://api.groq.com/openai/v1/chat/completions',
       {
@@ -373,7 +379,7 @@ bot.on('photo', async (msg) => {
       },
       {
         headers: {
-          'Authorization': `Bearer ${process.env.GROQ_API_KEY.trim()}`,
+          'Authorization': `Bearer ${groqKey}`,
           'Content-Type': 'application/json'
         },
         timeout: 45000
@@ -561,6 +567,7 @@ bot.on('message', async (msg) => {
   if (!text.startsWith('/')) {
     try {
       console.log(`Обрабатываем сообщение: "${text}"`);
+      const groqKey = process.env.GROQ_API_KEY ? process.env.GROQ_API_KEY.trim() : '';
 
       const intentResponse = await axiosClient.post(
         '[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)',
@@ -577,7 +584,7 @@ bot.on('message', async (msg) => {
         },
         {
           headers: {
-            'Authorization': `Bearer ${process.env.GROQ_API_KEY.trim()}`,
+            'Authorization': `Bearer ${groqKey}`,
             'Content-Type': 'application/json'
           }
         }
@@ -632,13 +639,17 @@ bot.on('message', async (msg) => {
         },
         {
           headers: {
-            'Authorization': `Bearer ${process.env.GROQ_API_KEY.trim()}`,
+            'Authorization': `Bearer ${groqKey}`,
             'Content-Type': 'application/json'
           }
         }
       );
 
       const parsed = JSON.parse(parseResponse.data.choices[0].message.content);
+
+      if (!parsed.amount || isNaN(Number(parsed.amount))) {
+        return safeSendMessage(chatId, '🐗 Кабан не нашёл сумму в сообщении. Напиши, например: `Такси 300` или `50000 фо бо`.', { parse_mode: 'Markdown' });
+      }
 
       await processExpense(msg, {
         amount: parsed.amount,
@@ -669,4 +680,5 @@ process.on('unhandledRejection', (reason) => {
 });
 
 console.log('Бот "Кабан Финансист" успешно запущен и готов к деплою!');
+
 
