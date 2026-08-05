@@ -132,7 +132,6 @@ async function handleDeleteLast(chatId, userId, messageIdToEdit = null) {
   const kabanName = USERS[numericUserId] || USERS[userId] || '';
 
   try {
-    // Отправляем ID и Имя, чтобы Google удалил ИМЕННО ТРАТУ ЭТОГО КАБАНА
     await axiosClient.post(scriptUrl, {
       action: 'delete_last',
       telegramId: userId,
@@ -167,7 +166,6 @@ async function handleDeleteLast(chatId, userId, messageIdToEdit = null) {
       await safeSendMessage(chatId, '🗑 *Твоя последняя трата удалена!*', { parse_mode: 'Markdown' });
     }
   } finally {
-    // Снимаем блокировку после завершения
     if (messageIdToEdit) {
       pendingDeletions.delete(messageIdToEdit);
     }
@@ -187,7 +185,7 @@ async function sendMainMenu(chatId) {
   });
 }
 
-// Функция обработки и сохранения траты
+// Функция обработки и сохранения одной траты
 async function processExpense(msg, data) {
   const userId = msg.from.id;
   const chatId = msg.chat.id;
@@ -462,7 +460,6 @@ bot.on('callback_query', async (query) => {
   const userId = query.from.id;
   const messageId = query.message.message_id;
 
-  // Мгновенно гасим часики на кнопке в Telegram
   try {
     await bot.answerCallbackQuery(query.id);
   } catch (e) {}
@@ -484,16 +481,13 @@ bot.on('callback_query', async (query) => {
       { parse_mode: 'Markdown' }
     );
   } else if (query.data === 'DELETE_LAST') {
-    // ПРОВЕРКА LOCK-ЗАЩИТЫ: Если эта кнопка уже нажимается — игнорируем повторный клик!
     if (pendingDeletions.has(messageId)) {
       console.log(`⚠️ Попытка повторного клика по сообщению ${messageId} заблокирована.`);
       return;
     }
 
-    // Блокируем сообщение от повторных кликов
     pendingDeletions.add(messageId);
 
-    // МГНОВЕННО УБИРАЕМ КНОПКУ из сообщения
     try {
       await bot.editMessageText('⏳ *Удаляю трату из таблицы...*', {
         chat_id: chatId,
@@ -502,7 +496,6 @@ bot.on('callback_query', async (query) => {
       });
     } catch (e) {}
 
-    // Запускаем процесс точечного удаления
     await handleDeleteLast(chatId, userId, messageId);
   }
 });
@@ -597,13 +590,12 @@ bot.on('message', async (msg) => {
     return handleDeleteLast(chatId, userId);
   }
 
-  // 6. Обычный ввод траты или команда
+  // 6. Обычный ввод трат (одновременно одной или нескольких)
   if (!text.startsWith('/')) {
     try {
       console.log(`[ТЕКСТ ВХОД]: "${text}"`);
       const groqKey = process.env.GROQ_API_KEY ? process.env.GROQ_API_KEY.trim() : '';
 
-      // Единый AI-запрос
       const singleAiResponse = await axiosClient.post(
         '[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)',
         {
@@ -617,22 +609,22 @@ bot.on('message', async (msg) => {
 ФОРМАТ JSON:
 {
   "intent": "add_expense" | "delete" | "analytics",
-  "amount": число_или_null,
-  "category": "Категория",
-  "description": "Описание траты на русском",
-  "type": "Общий" | "Личный"
+  "expenses": [
+    {
+      "amount": число,
+      "category": "Категория",
+      "description": "Описание траты на русском",
+      "type": "Общий" | "Личный"
+    }
+  ]
 }
 
-ПРАВИЛА ОПРЕДЕЛЕНИЯ ИНТЕНТА:
-- "delete": если просит отменить/удалить (например: "удали", "отмени", "ошибка", "убери").
-- "analytics": если просит статистику/анализ/вопрос по деньгам (например: "сколько потратили", "анализ", "отчет").
-- "add_expense": во всех остальных случаях (ввод траты).
-
-ПРАВИЛА ИЗВЛЕЧЕНИЯ ДАННЫХ ДЛЯ add_expense:
-1. amount: Извлеки чистое число траты. Пробелы в тысячах (например 100 000) или точки (100.000) превращай в обычное число 100000.
-2. category: Одна из: Продукты, Бухло, Вкусняшки кабаньи, Транспорт, Жилье и Коммуналка, Развлечения и Отдых, Здоровье и Аптека, Покупки и Шмотки, Кафе и Рестораны, Подарки и Донаты.
-3. type: "Личный" (если есть "себе", "мне", "личный", или шмотки/аптека) иначе "Общий".
-4. description: Короткое понятное название на русском.`
+ПРАВИЛА:
+1. intent: "delete" (если просит отменить/удалить), "analytics" (если просит отчёт/статистику), иначе "add_expense".
+2. В ВЕТКЕ add_expense: Сообщение может содержать КАК ОДНУ ТРАТУ, ТАК И СПИСОК ТРАТ (через запятую, новую строку или с союзом и). Выдели ВСЕ отдельные траты в массив "expenses".
+3. amount: Чистое число. Тысячные разделения (100 000) объединяй в 100000.
+4. category: Из списка: Продукты, Бухло, Вкусняшки кабаньи, Транспорт, Жилье и Коммуналка, Развлечения и Отдых, Здоровье и Аптека, Покупки и Шмотки, Кафе и Рестораны, Подарки и Донаты.
+5. type: "Личный" (если есть "себе", "мне", "личный", или шмотки/аптека) иначе "Общий".`
             },
             { role: 'user', content: text }
           ],
@@ -650,12 +642,11 @@ bot.on('message', async (msg) => {
       let parsed = {};
       try {
         parsed = JSON.parse(singleAiResponse.data.choices[0].message.content);
-        console.log('[AI РЕЗУЛЬТАТ]:', parsed);
+        console.log('[AI РЕЗУЛЬТАТ]:', JSON.stringify(parsed));
       } catch (e) {
         console.error('Ошибка парсинга JSON от Groq:', e.message);
       }
 
-      // Перенаправление интентов
       if (parsed.intent === 'analytics') {
         return handleAnalytics(msg);
       }
@@ -663,57 +654,81 @@ bot.on('message', async (msg) => {
         return handleDeleteLast(chatId, userId);
       }
 
-      // Достаем число
-      let finalAmount = Number(parsed.amount || parsed.price);
+      // Извлекаем массив трат
+      let expensesList = Array.isArray(parsed.expenses) ? parsed.expenses : [];
 
-      // ЖЕЛЕЗНЫЙ РЕЗЕРВНЫЙ ПАРСЕР ЧИСЕЛ (Фоллбэк через регулярку Node.js)
-      if (isNaN(finalAmount) || finalAmount <= 0) {
-        console.log('⚠️ AI не смог вытащить amount, включаем Резервный Парсер...');
-        const cleanedText = text.replace(/(\d+)\s+(\d{3})/g, '$1$2').replace(',', '.');
-        const match = cleanedText.match(/\d+(\.\d+)?/);
-        if (match) {
-          finalAmount = parseFloat(match[0]);
-          console.log(`[РЕЗЕРВНЫЙ ПАРСЕР УСПЕХ]: извлечено число ${finalAmount}`);
+      // Резервная обработка, если Llama не вернула список или перепутала структуру
+      if (expensesList.length === 0) {
+        if (parsed.amount || parsed.price) {
+          expensesList.push(parsed);
+        } else {
+          // Разбиваем текст по переносам строк или запятым
+          const lines = text.split(/[\n,;]+/).map(s => s.trim()).filter(Boolean);
+          for (const line of lines) {
+            const cleanedText = line.replace(/(\d+)\s+(\d{3})/g, '$1$2').replace(',', '.');
+            const match = cleanedText.match(/\d+(\.\d+)?/);
+            if (match) {
+              const fallbackAmount = parseFloat(match[0]);
+              const fallbackDesc = line.replace(/\d+/g, '').trim() || 'Трата';
+              expensesList.push({
+                amount: fallbackAmount,
+                category: 'Продукты',
+                description: fallbackDesc,
+                type: 'Общий'
+              });
+            }
+          }
         }
       }
 
-      // Если цифры нет вообще
-      if (isNaN(finalAmount) || finalAmount <= 0) {
+      // Если ни одной траты вытащить не удалось
+      if (expensesList.length === 0) {
         return safeSendMessage(
           chatId, 
-          '🐗 Кабан не нашёл сумму в сообщении. Напиши цифрами, например: `Такси 300` или `50000 фо бо`.', 
+          '🐗 Кабан не нашёл сумму в сообщении. Напиши цифрами, например: `Такси 300` или список:\n`Такси 300`\n`Пиво 500`', 
           { parse_mode: 'Markdown' }
         );
       }
 
-      let description = parsed.description || text.replace(/\d+/g, '').trim() || 'Трата';
-
-      await processExpense(msg, {
-        amount: finalAmount,
-        category: parsed.category || 'Продукты',
-        description: description,
-        type: parsed.type || 'Общий'
-      });
+      // Заносим каждую трату по очереди
+      for (const item of expensesList) {
+        let finalAmount = Number(item.amount || item.price) || 0;
+        
+        if (finalAmount > 0) {
+          await processExpense(msg, {
+            amount: finalAmount,
+            category: item.category || 'Продукты',
+            description: item.description || 'Трата',
+            type: item.type || 'Общий'
+          });
+        }
+      }
 
     } catch (error) {
       console.error('--- ОШИБКА ОБРАБОТКИ ТЕКСТА ---', error.response?.data || error.message);
       
-      // Спасаем трату через Резервный Парсер даже при краше сети
-      const cleanedText = text.replace(/(\d+)\s+(\d{3})/g, '$1$2').replace(',', '.');
-      const match = cleanedText.match(/\d+(\.\d+)?/);
-      
-      if (match) {
-        const fallbackAmount = parseFloat(match[0]);
-        console.log(`[CRASH FALLBACK SUCCESS]: Вытащили ${fallbackAmount} без участия AI`);
-        return await processExpense(msg, {
-          amount: fallbackAmount,
-          category: 'Продукты',
-          description: text.replace(/\d+/g, '').trim() || 'Трата',
-          type: 'Общий'
-        });
+      // Фоллбэк мульти-строк при полном сбое сети/API
+      const lines = text.split(/[\n,;]+/).map(s => s.trim()).filter(Boolean);
+      let processedAny = false;
+
+      for (const line of lines) {
+        const cleanedText = line.replace(/(\d+)\s+(\d{3})/g, '$1$2').replace(',', '.');
+        const match = cleanedText.match(/\d+(\.\d+)?/);
+        if (match) {
+          const fallbackAmount = parseFloat(match[0]);
+          await processExpense(msg, {
+            amount: fallbackAmount,
+            category: 'Продукты',
+            description: line.replace(/\d+/g, '').trim() || 'Трата',
+            type: 'Общий'
+          });
+          processedAny = true;
+        }
       }
 
-      safeSendMessage(chatId, '🐗 Упс! Не смог найти сумму. Напиши, например: `Такси 300`.');
+      if (!processedAny) {
+        safeSendMessage(chatId, '🐗 Упс! Не смог найти сумму. Напиши, например: `Такси 300`.');
+      }
     }
   }
 });
