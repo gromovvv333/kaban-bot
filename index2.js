@@ -400,6 +400,7 @@ bot.on('photo', async (msg) => {
 
     // 4. Запрос к Groq с оптимизированными параметрами
     const visionResponse = await axiosClient.post(
+      'https://api.groq.com/openai/v1/chat/completions?max_tokens=4096&reasoning_format=hidden',
       'https://api.groq.com/openai/v1/chat/completions?max_tokens=4096',
       'https://api.groq.com/openai/v1/chat/completions',
       {
