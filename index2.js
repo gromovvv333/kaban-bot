@@ -374,16 +374,21 @@ bot.on('photo', async (msg) => {
     const photo = msg.photo[msg.photo.length - 1];
     const token = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 
-    // 1. Получаем путь к файлу
-    const fileInfoRes = await axios.get(`[https://api.telegram.org/bot$](https://api.telegram.org/bot$){token}/getFile?file_id=${photo.file_id}`);
+    if (!token) {
+      return safeSendMessage(chatId, '🐗 Ошибка: Не задан TELEGRAM_BOT_TOKEN в .env!');
+    }
+
+    // 1. Получаем путь к файлу с явным URL
+    const getFileUrl = `https://api.telegram.org/bot${token}/getFile?file_id=${photo.file_id}`;
+    const fileInfoRes = await axios.get(getFileUrl);
     const filePath = fileInfoRes.data?.result?.file_path;
 
     if (!filePath) {
-      throw new Error('Не удалось получить путь к фото');
+      throw new Error('Не удалось получить путь к файлу от Telegram API');
     }
 
     // 2. Скачиваем оригинальный файл
-    const fileDownloadUrl = `[https://api.telegram.org/file/bot$](https://api.telegram.org/file/bot$){token}/${filePath}`;
+    const fileDownloadUrl = `https://api.telegram.org/file/bot${token}/${filePath}`;
     const imageResponse = await axios.get(fileDownloadUrl, { 
       responseType: 'arraybuffer',
       timeout: 30000 
@@ -404,9 +409,9 @@ bot.on('photo', async (msg) => {
       return safeSendMessage(chatId, '🐗 Ошибка: Не задан GROQ_API_KEY!');
     }
 
-    // 4. Запрос к Groq
+    // 4. Запрос к Groq API
     const visionResponse = await axiosClient.post(
-      '[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)',
+      'https://api.groq.com/openai/v1/chat/completions',
       {
         model: 'qwen/qwen3.6-27b',
         reasoning_format: 'hidden',
@@ -469,7 +474,7 @@ bot.on('photo', async (msg) => {
       console.error('Ошибка парсинга JSON от Groq:', rawContent);
       return safeSendMessage(
         chatId, 
-        '🐗 Чек слишком длинный или неразборчивый. Попробуй сфотографировать чуть ближе или разбить на два кадра!'
+        '🐗 Чек слишком длинный или неразборчивый. Попробуй сфотографировать чуть ближе!'
       );
     }
     
