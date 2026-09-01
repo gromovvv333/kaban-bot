@@ -51,8 +51,8 @@ loadRates();
 // ==================== НАСТРОЙКА СЕТИ И БОТА ====================
 
 const httpsAgent = new https.Agent({
-  keepAlive: false,        // Не держим зависшие сокеты
-  timeout: 30000,          // Таймаут сокета 30 секунд
+  keepAlive: false,
+  timeout: 30000,
   freeSocketTimeout: 5000
 });
 
@@ -69,7 +69,7 @@ const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, {
     interval: 500,
     autoStart: true,
     params: { 
-      timeout: 10          // Сбрасываем длинное висение Telegram
+      timeout: 10
     }
   },
   request: {
@@ -365,10 +365,10 @@ bot.on('photo', async (msg) => {
   try {
     const photo = msg.photo[msg.photo.length - 1];
     
-    const file = await bot.getFile(photo.file_id);
-    const fileUrl = `[https://api.telegram.org/file/bot$](https://api.telegram.org/file/bot$){process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
+    // Получаем прямую валидную ссылку от Telegram API
+    const fileLink = await bot.getFileLink(photo.file_id);
 
-    const imageResponse = await axios.get(fileUrl, { 
+    const imageResponse = await axios.get(fileLink, { 
       responseType: 'arraybuffer',
       timeout: 30000 
     });
@@ -377,6 +377,11 @@ bot.on('photo', async (msg) => {
     const captionText = msg.caption ? `Подпись от пользователя к фото: "${msg.caption}"` : 'Подписи нет.';
 
     const groqKey = process.env.GROQ_API_KEY ? process.env.GROQ_API_KEY.trim() : '';
+
+    if (!groqKey) {
+      return safeSendMessage(chatId, '🐗 Ошибка: Не задан GROQ_API_KEY в переменных окружения Render!');
+    }
+
     const visionResponse = await axiosClient.post(
       '[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)',
       {
@@ -426,7 +431,7 @@ bot.on('photo', async (msg) => {
       }
     );
     
-    const rawContent = visionResponse.data.choices[0].message.content;
+    const rawContent = visionResponse.data?.choices?.[0]?.message?.content;
     const data = cleanAndParseJSON(rawContent);
     
     if (data.items && data.items.length > 0) {
@@ -457,7 +462,8 @@ bot.on('photo', async (msg) => {
     }
 
   } catch (error) {
-    console.error('Ошибка обработки фото:', error.response?.data || error.message);
+    const errorDetails = error.response?.data?.error?.message || error.message || String(error);
+    console.error('Ошибка обработки фото:', errorDetails);
 
     if (error.response?.data?.error?.code === 'rate_limit_exceeded') {
       return safeSendMessage(
@@ -467,7 +473,7 @@ bot.on('photo', async (msg) => {
       );
     }
 
-    safeSendMessage(chatId, '🐗 Упс! Кабан не смог разобрать чек. Попробуй сделать фото четче или отправь текстом.');
+    safeSendMessage(chatId, `🐗 Ошибка обработки фото: ${errorDetails}`);
   }
 });
 
@@ -756,4 +762,5 @@ process.on('unhandledRejection', (reason) => {
 });
 
 console.log('Бот "Кабан Финансист" успешно запущен и готов к деплою!');
+
 
