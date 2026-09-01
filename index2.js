@@ -365,20 +365,128 @@ bot.on('photo', async (msg) => {
   } catch (e) {}
 
   try {
-    const photo = msg.photo[msg.photo.length - 1]; // Берём высокое разрешение
+    const photo = msg.photo[msg.photo.length - 1];
+    
     const file = await bot.getFile(photo.file_id);
-    const fileUrl = `[https://api.telegram.org/file/bot$](https://api.telegram.org/file/bot$){process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
+    const fileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
 
     const imageResponse = await axios.get(fileUrl, { 
       responseType: 'arraybuffer',
-      timeout: 20000 
+      timeout: 30000 
     });
     
     const base64Image = Buffer.from(imageResponse.data, 'binary').toString('base64');
     const captionText = msg.caption ? `Подпись от пользователя к фото: "${msg.caption}"` : 'Подписи нет.';
 
     const groqKey = process.env.GROQ_API_KEY ? process.env.GROQ_API_KEY.trim() : '';
+
+    // Запрос к твоей проверенной модели Qwen
+    const visionResponse = await axios.post(
+      'https://api.groq.com/openai/v1/chat/completions',
+      {
+        model: 'qwen/qwen3.6-27b',
+        reasoning_format: 'hidden',
+        messages: [
+          {
+            role: 'system',
+            content: `Верни СТРОГО валидный JSON в таком формате, без лишнего текста и без блоков кода:
+{
+  "items": [
+    {
+      "name": "название на русском",
+      "price": число,
+      "category": "Категория",
+      "type": "Общий"
+    }
+  ]
+}
+
+Категории: Продукты, Бухло, Вкусняшки кабаньи, Транспорт, Жилье и Коммуналка, Развлечения и Отдых, Здоровье и Аптека, Покупки и Шмотки, Кафе и Рестораны, Подарки и Донаты.
+Тип: "Личный" или "Общий".
+
+ПРАВИЛА ДЛЯ ВЬЕТНАМСКИХ ЧЕКОВ (VND):
+Точки и запятые — это разделители тысяч (7.000 = 7 000, а не 7 миллионов). Вода, кофе и мелкие продукты не стоят миллионы.`
+          },
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: captionText },
+              {
+                type: 'image_url',
+                image_url: {
+                  url: `data:image/jpeg;base64,${base64Image}`
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${groqKey}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 45000
+      }
+    );
     
+    let rawContent = visionResponse.data.choices[0].message.content.trim();
+    
+    // Чистим ответ от возможных тэгoв мышления и markdown-блоков
+    rawContent = rawContent.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+    rawContent = rawContent.replace(/^```json\s*/i, '').replace(/^```\s*/, '').replace(/\s*```$/, '').trim();
+    
+    // Находим чистый JSON
+    const firstBrace = rawContent.indexOf('{');
+    const lastBrace = rawContent.lastIndexOf('}');
+    if (firstBrace !== -1 && lastBrace !== -1) {
+      rawContent = rawContent.substring(firstBrace, lastBrace + 1);
+    }
+
+    const data = JSON.parse(rawContent);
+    
+    if (data.items && data.items.length > 0) {
+      for (const item of data.items) {
+        let fixedPrice = Number(item.price) || 0;
+        const lowerName = (item.name || '').toLowerCase();
+
+        const isSmallItem = lowerName.includes('вод') || lowerName.includes('water') || lowerName.includes('minh') || 
+                            lowerName.includes('кофе') || lowerName.includes('чай') || lowerName.includes('снек') || 
+                            lowerName.includes('чипсы') || lowerName.includes('пиво') || lowerName.includes('хлеб');
+
+        if (isSmallItem && fixedPrice > 500000) {
+          fixedPrice = fixedPrice / 1000;
+          console.log(`--- КАБАН ПЕРЕХВАТИЛ АБСУРДНУЮ ЦЕНУ: исправлено с ${item.price} на ${fixedPrice} для "${item.name}" ---`);
+        } else if (fixedPrice > 10000000) {
+          fixedPrice = fixedPrice / 1000;
+        }
+
+        await processExpense(msg, {
+          amount: fixedPrice,
+          category: item.category || 'Продукты',
+          description: item.name || 'Товар с чека',
+          type: item.type || 'Общий'
+        });
+      }
+    } else {
+      safeSendMessage(chatId, '🐗 Кабан присмотрелся, но не разглядел позиций на чеке.');
+    }
+
+  } catch (error) {
+    console.error('Ошибка обработки фото:', error.response?.data || error.message);
+
+    if (error.response?.data?.error?.code === 'rate_limit_exceeded') {
+      return safeSendMessage(
+        chatId, 
+        '🐗 *Кабан слишком быстро разглядывал чеки!* Лимит нейросети превышен.\n\nПодожди 15 секунд и отправь чек снова!', 
+        { parse_mode: 'Markdown' }
+      );
+    }
+
+    safeSendMessage(chatId, '🐗 Упс! Кабан не смог разобрать чек. Попробуй сделать фото четче или отправь текстом.');
+  }
+});
+
     // Используем llama-3.2-11b-vision-preview (она значительно точнее парсит чеки в JSON)
     const visionResponse = await axios.post(
       '[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)',
