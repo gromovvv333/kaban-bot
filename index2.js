@@ -363,12 +363,21 @@ bot.on('photo', async (msg) => {
   } catch (e) {}
 
   try {
-    const photo = msg.photo[msg.photo.length - 1];
-    
-    // Получаем прямую валидную ссылку от Telegram API
-    const fileLink = await bot.getFileLink(photo.file_id);
+    const photo = msg.photo[msg.photo.length - 1]; // Берем фото в самом высоком разрешении
+    const token = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 
-    const imageResponse = await axios.get(fileLink, { 
+    // 1. Получаем путь к файлу прямо через Telegram API
+    const fileInfoRes = await axios.get(`https://api.telegram.org/bot${token}/getFile?file_id=${photo.file_id}`);
+    const filePath = fileInfoRes.data?.result?.file_path;
+
+    if (!filePath) {
+      throw new Error('Не удалось получить путь к фото от Telegram API');
+    }
+
+    // 2. Скачиваем сам файл по строго сформированному URL
+    const fileDownloadUrl = `https://api.telegram.org/file/bot${token}/${filePath}`;
+    
+    const imageResponse = await axios.get(fileDownloadUrl, { 
       responseType: 'arraybuffer',
       timeout: 30000 
     });
@@ -376,14 +385,15 @@ bot.on('photo', async (msg) => {
     const base64Image = Buffer.from(imageResponse.data, 'binary').toString('base64');
     const captionText = msg.caption ? `Подпись от пользователя к фото: "${msg.caption}"` : 'Подписи нет.';
 
-    const groqKey = process.env.GROQ_API_KEY ? process.env.GROQ_API_KEY.trim() : '';
+    const groqKey = (process.env.GROQ_API_KEY || '').trim();
 
     if (!groqKey) {
-      return safeSendMessage(chatId, '🐗 Ошибка: Не задан GROQ_API_KEY в переменных окружения Render!');
+      return safeSendMessage(chatId, '🐗 Ошибка: Не задан GROQ_API_KEY!');
     }
 
-    const visionResponse = await axiosClient.post(
-      '[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)',
+    // 3. Отправляем в Groq Vision (Qwen)
+    const visionResponse = await axios.post(
+      'https://api.groq.com/openai/v1/chat/completions',
       {
         model: 'qwen/qwen3.6-27b',
         reasoning_format: 'hidden',
@@ -445,7 +455,6 @@ bot.on('photo', async (msg) => {
 
         if (isSmallItem && fixedPrice > 500000) {
           fixedPrice = Math.round(fixedPrice / 1000);
-          console.log(`--- КАБАН ПЕРЕХВАТИЛ АБСУРДНУЮ ЦЕНУ: исправлено с ${item.price} на ${fixedPrice} для "${item.name}" ---`);
         } else if (fixedPrice > 10000000) {
           fixedPrice = Math.round(fixedPrice / 1000);
         }
