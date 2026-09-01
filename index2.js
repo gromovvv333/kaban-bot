@@ -330,18 +330,49 @@ bot.on('photo', async (msg) => {
   } catch (e) {}
 
   try {
+    if (!msg.photo || !Array.isArray(msg.photo) || msg.photo.length === 0) {
+      return safeSendMessage(chatId, '🐗 Ошибка: Telegram не передал массив фото.');
+    }
+
+    // Берем самое крупное фото
     const photo = msg.photo[msg.photo.length - 1];
+    const fileId = photo.file_id;
 
-    // БЕЗОПАСНОЕ ПОЛУЧЕНИЕ ССЫЛКИ НА ФАЙЛ
-    const downloadUrl = await bot.getFileLink(photo.file_id);
-    console.log('--> Ссылка на скачивание файла сформирована!');
+    // ПРОВЕРКА 1: Проверяем, что file_id вообще существует и это строка
+    if (!fileId || typeof fileId !== 'string') {
+      console.error('❌ КРИТИЧЕСКАЯ ОШИБКА: file_id не является строкой!', photo);
+      return safeSendMessage(chatId, '🐗 Ошибка: Некорректный ID файла от Telegram.');
+    }
 
+    const token = cleanEnvVar(process.env.TELEGRAM_BOT_TOKEN);
+    if (!token) {
+      return safeSendMessage(chatId, '🐗 Ошибка: Не задан TELEGRAM_BOT_TOKEN в переменных!');
+    }
+
+    // 1. Получаем путь к файлу напрямую через Telegram API
+    const getFileApiUrl = `https://api.telegram.org/bot${token}/getFile?file_id=${encodeURIComponent(fileId)}`;
+    
+    // Используем нативный fetch Node.js вместо сторонних библиотек
+    const fileRes = await fetch(getFileApiUrl);
+    const fileData = await fileRes.json();
+
+    if (!fileData.ok || !fileData.result || !fileData.result.file_path) {
+      console.error('❌ Ошибка ответа Telegram getFile:', fileData);
+      return safeSendMessage(chatId, '🐗 Telegram не отдал путь к файлу чека.');
+    }
+
+    const cleanFilePath = String(fileData.result.file_path).trim();
+    const downloadUrl = `https://api.telegram.org/file/bot${token}/${cleanFilePath}`;
+    
+    console.log('--> Ссылка на скачивание успешно собрана:', downloadUrl);
+
+    // 2. Скачиваем файл через axios как бинарник
     const imageResponse = await axios.get(downloadUrl, { 
       responseType: 'arraybuffer',
       timeout: 30000 
     });
 
-    // Оптимизация под длинные чеки (1280px по ширине/высоте)
+    // 3. Оптимизация через sharp
     const compressedBuffer = await sharp(imageResponse.data)
       .resize(1280, 1280, { fit: 'inside', withoutEnlargement: true })
       .jpeg({ quality: 85 })
@@ -351,9 +382,13 @@ bot.on('photo', async (msg) => {
     const captionText = msg.caption ? `Подпись к чеку: "${msg.caption}"` : 'Без подписи.';
     const groqKey = cleanEnvVar(process.env.GROQ_API_KEY);
 
-    // Запрос к Vision
+    if (!groqKey) {
+      return safeSendMessage(chatId, '🐗 Ошибка: Не задан GROQ_API_KEY!');
+    }
+
+    // 4. Запрос к Groq Vision
     const visionResponse = await axios.post(
-      '[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)',
+      'https://api.groq.com/openai/v1/chat/completions',
       {
         model: 'qwen/qwen3.6-27b',
         reasoning_format: 'hidden',
@@ -431,7 +466,7 @@ bot.on('photo', async (msg) => {
 
   } catch (error) {
     const errorDetails = error.response?.data?.error?.message || error.message || String(error);
-    console.error('Ошибка обработки фото:', errorDetails);
+    console.error('❌ Ошибка в блоке photo:', error);
     safeSendMessage(chatId, `🐗 Ошибка обработки фото: ${errorDetails}`);
   }
 });
