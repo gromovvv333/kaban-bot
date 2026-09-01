@@ -50,9 +50,10 @@ loadRates();
 
 // ==================== НАСТРОЙКА СЕТИ И БОТА ====================
 
+// Отдельный агент для быстрых запросов
 const httpsAgent = new https.Agent({
-  keepAlive: false,        // Не держим зависшие сокеты
-  timeout: 10000,          // Таймаут сокета 10 секунд
+  keepAlive: false,
+  timeout: 30000,          // Увеличено до 30с для стабильности
   freeSocketTimeout: 5000
 });
 
@@ -69,12 +70,12 @@ const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, {
     interval: 500,
     autoStart: true,
     params: { 
-      timeout: 10          // Сбрасываем длинное висение Telegram
+      timeout: 10          
     }
   },
   request: {
     agent: httpsAgent,
-    timeout: 15000
+    timeout: 30000
   }
 });
 
@@ -86,7 +87,7 @@ bot.on('polling_error', (error) => {
   }
 });
 
-// Безопасная отправка сообщений с авто-повтором при сетевых миганиях
+// Безопасная отправка сообщений с авто-повтором
 async function safeSendMessage(chatId, text, options = {}, retries = 3) {
   for (let i = 0; i < retries; i++) {
     try {
@@ -120,7 +121,7 @@ const USERS = {
   333816615: 'Кабанка'         // Telegram ID Алисы
 };
 
-// Функция точечного удаления конкретной траты (или последней из меню)
+// Функция точечного удаления конкретной траты
 async function handleDeleteExpense(chatId, userId, messageIdToDelete = null) {
   const scriptUrl = process.env.GOOGLE_SCRIPT_URL ? process.env.GOOGLE_SCRIPT_URL.trim() : null;
   if (!scriptUrl) {
@@ -194,7 +195,7 @@ async function processExpense(msg, data) {
   const numericUserId = Number(userId);
   const kabanName = USERS[numericUserId] || USERS[userId] || 'Главный кабан';
   
-  const currentCurr = userCurrencies[chatId] || 'RUB';
+  const currentCurr = userCurrencies[chatId] || 'VND'; // По умолчанию во Вьетнаме ставь VND
   
   const rawAmount = Number(data.amount) || 0;
   let amountRub = rawAmount;
@@ -228,19 +229,17 @@ async function processExpense(msg, data) {
 
   const textMessage =
     `${greetingHeader}\n\n` +
-    `💸 *Сумма:* ${amountRub.toFixed(2)} ₽${currentCurr !== 'RUB' ? ` (${rawAmount.toLocaleString()} ${currentCurr}${currencySymbols[currentCurr]})` : ''}\n` +
+    `💸 *Сумма:* ${amountRub.toFixed(2)} ₽${currentCurr !== 'RUB' ? ` (${Math.round(rawAmount).toLocaleString('ru-RU')} ${currentCurr}${currencySymbols[currentCurr] || ''})` : ''}\n` +
     `📂 *Категория:* ${data.category}\n` +
     `📝 *Описание:* ${data.description || 'без описания'}\n` +
     `🏷 *Тип:* ${data.type || 'Общий'}\n\n` +
     `📊 _Зарубил на носу и отправляю в дубраву (таблицу)!_`;
 
-  // 1. Отправляем сообщение без кнопки, чтобы узнать его message_id
   const sentMsg = await safeSendMessage(chatId, textMessage, { parse_mode: 'Markdown' });
   if (!sentMsg) return;
 
   const sentMessageId = sentMsg.message_id;
 
-  // 2. Добавляем инлайн-кнопку с привязанным к ней message_id
   try {
     await bot.editMessageReplyMarkup({
       inline_keyboard: [
@@ -252,7 +251,6 @@ async function processExpense(msg, data) {
     });
   } catch (e) {}
 
-  // 3. Отправляем в Google Таблицу данные вместе с messageId (в столбец H)
   const scriptUrl = process.env.GOOGLE_SCRIPT_URL ? process.env.GOOGLE_SCRIPT_URL.trim() : null;
   if (scriptUrl && scriptUrl.startsWith('http')) {
     try {
@@ -343,6 +341,21 @@ async function handleAnalytics(msg) {
   }
 }
 
+// Вспомогательная функция очистки JSON от нейросетей
+function cleanAndParseJSON(rawText) {
+  let text = rawText.trim();
+  text = text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+  text = text.replace(/^```json\s*/i, '').replace(/^```\s*/, '').replace(/\s*```$/, '').trim();
+  
+  // Ищем первый `{` и последний `}`
+  const firstBrace = text.indexOf('{');
+  const lastBrace = text.lastIndexOf('}');
+  if (firstBrace !== -1 && lastBrace !== -1) {
+    text = text.substring(firstBrace, lastBrace + 1);
+  }
+  return JSON.parse(text);
+}
+
 // Обработчик фото сообщений (чеков)
 bot.on('photo', async (msg) => {
   const chatId = msg.chat.id;
@@ -352,45 +365,50 @@ bot.on('photo', async (msg) => {
   } catch (e) {}
 
   try {
-    const photo = msg.photo[msg.photo.length - 1];
-    
+    const photo = msg.photo[msg.photo.length - 1]; // Берём высокое разрешение
     const file = await bot.getFile(photo.file_id);
-    const fileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
+    const fileUrl = `[https://api.telegram.org/file/bot$](https://api.telegram.org/file/bot$){process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
 
     const imageResponse = await axios.get(fileUrl, { 
       responseType: 'arraybuffer',
-      timeout: 30000 
+      timeout: 20000 
     });
     
     const base64Image = Buffer.from(imageResponse.data, 'binary').toString('base64');
     const captionText = msg.caption ? `Подпись от пользователя к фото: "${msg.caption}"` : 'Подписи нет.';
 
     const groqKey = process.env.GROQ_API_KEY ? process.env.GROQ_API_KEY.trim() : '';
-    const visionResponse = await axiosClient.post(
-      'https://api.groq.com/openai/v1/chat/completions',
+    
+    // Используем llama-3.2-11b-vision-preview (она значительно точнее парсит чеки в JSON)
+    const visionResponse = await axios.post(
+      '[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)',
       {
-        model: 'qwen/qwen3.6-27b',
-        reasoning_format: 'hidden',
+        model: 'llama-3.2-11b-vision-preview',
+        temperature: 0.1,
         messages: [
           {
             role: 'system',
-            content: `Верни СТРОГО валидный JSON в таком формате, без лишнего текста и без блоков кода:
+            content: `Ты — модуль распознавания азиатских и вьетнамских чеков.
+Проанализируй чек и верни СТРОГО чистый JSON-объект без пояснений, без markdown разметки и без лишних слов.
+
+ФОРМАТ СТРОГО ТАКОЙ:
 {
   "items": [
     {
-      "name": "название на русском",
-      "price": число,
+      "name": "Название товара/услуги на русском",
+      "price": 50000,
       "category": "Категория",
       "type": "Общий"
     }
   ]
 }
 
-Категории: Продукты, Бухло, Вкусняшки кабаньи, Транспорт, Жилье и Коммуналка, Развлечения и Отдых, Здоровье и Аптека, Покупки и Шмотки, Кафе и Рестораны, Подарки и Донаты.
-Тип: "Личный" или "Общий".
-
-ПРАВИЛА ДЛЯ ВЬЕТНАМСКИХ ЧЕКОВ (VND):
-Точки и запятые — это разделители тысяч (7.000 = 7 000, а не 7 миллионов). Вода, кофе и мелкие продукты не стоят миллионы.`
+ПРАВИЛА ДЛЯ ВЬЕТНАМА (VND) И ЦЕН:
+1. Цены ВСЕГДА указывай целым числом в донгах (например 50000, 120000, 15000).
+2. На вьетнамских чеках точки и запятые — это разделители ТЫСЯЧ (например "50.000" = 50000, "15,000" = 15000). Если написано "50k", это 50000.
+3. Если чек длинный, объедини мелкие позиции или выдели итоговые суммы по категориям, чтобы вернуть НЕ БОЛЕЕ 5 главных позиций.
+4. Допустимые категории: Продукты, Бухло, Вкусняшки кабаньи, Транспорт, Жилье и Коммуналка, Развлечения и Отдых, Здоровье и Аптека, Покупки и Шмотки, Кафе и Рестораны, Подарки и Донаты.
+5. type: "Личный" или "Общий".`
           },
           {
             role: 'user',
@@ -411,31 +429,28 @@ bot.on('photo', async (msg) => {
           'Authorization': `Bearer ${groqKey}`,
           'Content-Type': 'application/json'
         },
-        timeout: 45000
+        timeout: 40000
       }
     );
     
-    let rawContent = visionResponse.data.choices[0].message.content.trim();
-    
-    rawContent = rawContent.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
-    rawContent = rawContent.replace(/^```json\s*/i, '').replace(/^```\s*/, '').replace(/\s*```$/, '').trim();
-    
-    const data = JSON.parse(rawContent);
+    const rawContent = visionResponse.data.choices[0].message.content;
+    console.log('--- СЫРОЙ ОТВЕТ VISION API ---', rawContent);
+
+    const data = cleanAndParseJSON(rawContent);
     
     if (data.items && data.items.length > 0) {
       for (const item of data.items) {
         let fixedPrice = Number(item.price) || 0;
         const lowerName = (item.name || '').toLowerCase();
 
-        const isSmallItem = lowerName.includes('вод') || lowerName.includes('water') || lowerName.includes('minh') || 
-                            lowerName.includes('кофе') || lowerName.includes('чай') || lowerName.includes('снек') || 
-                            lowerName.includes('чипсы') || lowerName.includes('пиво') || lowerName.includes('хлеб');
+        // Защитный фильтр аномальных цен
+        const isSmallItem = lowerName.includes('вод') || lowerName.includes('water') || lowerName.includes('кофе') || 
+                            lowerName.includes('чай') || lowerName.includes('снек') || lowerName.includes('пиво');
 
         if (isSmallItem && fixedPrice > 500000) {
-          fixedPrice = fixedPrice / 1000;
-          console.log(`--- КАБАН ПЕРЕХВАТИЛ АБСУРДНУЮ ЦЕНУ: исправлено с ${item.price} на ${fixedPrice} для "${item.name}" ---`);
-        } else if (fixedPrice > 10000000) {
-          fixedPrice = fixedPrice / 1000;
+          fixedPrice = Math.round(fixedPrice / 1000);
+        } else if (fixedPrice > 50000000) {
+          fixedPrice = Math.round(fixedPrice / 1000);
         }
 
         await processExpense(msg, {
@@ -493,7 +508,6 @@ bot.on('callback_query', async (query) => {
     const targetMsgId = Number(query.data.split('_')[2]);
 
     if (pendingDeletions.has(targetMsgId)) {
-      console.log(`⚠️ Попытка повторного клика по сообщению ${targetMsgId} заблокирована.`);
       return;
     }
 
@@ -559,8 +573,8 @@ bot.on('message', async (msg) => {
       reply_markup: {
         inline_keyboard: [
           [
-            { text: '🇷🇺 Рубли (RUB)', callback_data: 'CURRENCY_RUB' },
             { text: '🇻🇳 Донги (VND)', callback_data: 'CURRENCY_VND' },
+            { text: '🇷🇺 Рубли (RUB)', callback_data: 'CURRENCY_RUB' },
             { text: '🇹🇭 Баты (THB)', callback_data: 'CURRENCY_THB' }
           ]
         ]
@@ -571,7 +585,7 @@ bot.on('message', async (msg) => {
 
   // 3. Кнопка «Изменить курс»
   if (text === '⚙️ Изменить курс' || text === '/setrate') {
-    const currentCurr = userCurrencies[chatId] || 'RUB';
+    const currentCurr = userCurrencies[chatId] || 'VND';
 
     if (currentCurr === 'RUB') {
       return safeSendMessage(
@@ -603,13 +617,13 @@ bot.on('message', async (msg) => {
     return handleDeleteExpense(chatId, userId, null);
   }
 
-  // 6. Обычный ввод трат (одновременно одной или нескольких)
+  // 6. Обычный ввод трат
   if (!text.startsWith('/')) {
     try {
       console.log(`[ТЕКСТ ВХОД]: "${text}"`);
       const groqKey = process.env.GROQ_API_KEY ? process.env.GROQ_API_KEY.trim() : '';
 
-      const singleAiResponse = await axiosClient.post(
+      const singleAiResponse = await axios.post(
         '[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)',
         {
           model: 'llama-3.3-70b-versatile',
@@ -634,10 +648,10 @@ bot.on('message', async (msg) => {
 
 ПРАВИЛА:
 1. intent: "delete" (если просит отменить/удалить), "analytics" (если просит отчёт/статистику), иначе "add_expense".
-2. В ВЕТКЕ add_expense: Сообщение может содержать КАК ОДНУ ТРАТУ, ТАК И СПИСОК ТРАТ (через запятую, новую строку или с союзом и). Выдели ВСЕ отдельные траты в массив "expenses".
-3. amount: Чистое число. Тысячные разделения (100 000) объединяй в 100000.
+2. В ВЕТКЕ add_expense: Сообщение может содержать КАК ОДНУ ТРАТУ, ТАК И СПИСОК ТРАТ. Выдели ВСЕ отдельные траты в массив "expenses".
+3. amount: Чистое число. Вьетнамские суммы (например 100000 или 100k) переводи в полное число 100000.
 4. category: Из списка: Продукты, Бухло, Вкусняшки кабаньи, Транспорт, Жилье и Коммуналка, Развлечения и Отдых, Здоровье и Аптека, Покупки и Шмотки, Кафе и Рестораны, Подарки и Донаты.
-5. type: "Личный" (если есть "себе", "мне", "личный", или шмотки/аптека) иначе "Общий".`
+5. type: "Личный" или "Общий".`
             },
             { role: 'user', content: text }
           ],
@@ -652,13 +666,7 @@ bot.on('message', async (msg) => {
         }
       );
 
-      let parsed = {};
-      try {
-        parsed = JSON.parse(singleAiResponse.data.choices[0].message.content);
-        console.log('[AI РЕЗУЛЬТАТ]:', JSON.stringify(parsed));
-      } catch (e) {
-        console.error('Ошибка парсинга JSON от Groq:', e.message);
-      }
+      let parsed = cleanAndParseJSON(singleAiResponse.data.choices[0].message.content);
 
       if (parsed.intent === 'analytics') {
         return handleAnalytics(msg);
@@ -667,15 +675,12 @@ bot.on('message', async (msg) => {
         return handleDeleteExpense(chatId, userId, null);
       }
 
-      // Извлекаем массив трат
       let expensesList = Array.isArray(parsed.expenses) ? parsed.expenses : [];
 
-      // Резервная обработка, если Llama не вернула список или перепутала структуру
       if (expensesList.length === 0) {
         if (parsed.amount || parsed.price) {
           expensesList.push(parsed);
         } else {
-          // Разбиваем текст по переносам строк или запятым
           const lines = text.split(/[\n,;]+/).map(s => s.trim()).filter(Boolean);
           for (const line of lines) {
             const cleanedText = line.replace(/(\d+)\s+(\d{3})/g, '$1$2').replace(',', '.');
@@ -694,16 +699,14 @@ bot.on('message', async (msg) => {
         }
       }
 
-      // Если ни одной траты вытащить не удалось
       if (expensesList.length === 0) {
         return safeSendMessage(
           chatId, 
-          '🐗 Кабан не нашёл сумму в сообщении. Напиши цифрами, например: `Такси 300` или список:\n`Такси 300`\n`Пиво 500`', 
+          '🐗 Кабан не нашёл сумму в сообщении. Напиши цифрами, например: `Такси 30000` или список:\n`Такси 30000`\n`Кофе 45000`', 
           { parse_mode: 'Markdown' }
         );
       }
 
-      // Заносим каждую трату по очереди
       for (const item of expensesList) {
         let finalAmount = Number(item.amount || item.price) || 0;
         
@@ -720,7 +723,6 @@ bot.on('message', async (msg) => {
     } catch (error) {
       console.error('--- ОШИБКА ОБРАБОТКИ ТЕКСТА ---', error.response?.data || error.message);
       
-      // Фоллбэк мульти-строк при полном сбое сети/API
       const lines = text.split(/[\n,;]+/).map(s => s.trim()).filter(Boolean);
       let processedAny = false;
 
@@ -740,13 +742,12 @@ bot.on('message', async (msg) => {
       }
 
       if (!processedAny) {
-        safeSendMessage(chatId, '🐗 Упс! Не смог найти сумму. Напиши, например: `Такси 300`.');
+        safeSendMessage(chatId, '🐗 Упс! Не смог найти сумму.');
       }
     }
   }
 });
 
-// ГЛОБАЛЬНАЯ ЗАЩИТА ОТ ПАДЕНИЙ ПРОЦЕССА NODE.JS
 process.on('uncaughtException', (error) => {
   console.error('⚠️ [КАБАН ПЕРЕХВАТИЛ ИСКЛЮЧЕНИЕ]:', error.message);
 });
@@ -754,10 +755,11 @@ process.on('uncaughtException', (error) => {
 process.on('unhandledRejection', (reason) => {
   const errorMessage = reason?.message || String(reason);
   if (reason?.code === 'EFATAL' || errorMessage.includes('EFATAL')) {
-    console.log('⚠️ [Сбой TLS/Сети]: Запрос был отменен сетевым фильтром (переподключение...)');
+    console.log('⚠️ [Сбой TLS/Сети]: Запрос был отменен сетевым фильтром.');
   } else {
     console.error('⚠️ [НЕОБРАБОТАННЫЙ ПРОМИС]:', errorMessage);
   }
 });
 
-console.log('Бот "Кабан Финансист" успешно запущен и готов к деплою!');
+console.log('Бот "Кабан Финансист" успешно запущен!');
+
