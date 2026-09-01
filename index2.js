@@ -110,21 +110,30 @@ async function safeSendMessage(chatId, text, options = {}, retries = 3) {
 function cleanAndParseJSON(rawText) {
   let text = (rawText || '').trim();
   
-  // Вырезаем блоки мыслей <think>...</think>
+  // 1. Вырезаем блоки мыслей <think>...</think>, если они просочились
   if (text.includes('</think>')) {
     text = text.split('</think>')[1];
   }
   text = text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
   
-  // Очищаем маркдаун
+  // 2. Очищаем маркдаун-обертки ```json ... ```
   text = text.replace(/^```json\s*/i, '').replace(/^```\s*/, '').replace(/\s*```$/, '').trim();
   
+  // 3. Вырезаем всё, что находится ДО первой { и ПОСЛЕ последней }
   const firstBrace = text.indexOf('{');
   const lastBrace = text.lastIndexOf('}');
   if (firstBrace !== -1 && lastBrace !== -1) {
     text = text.substring(firstBrace, lastBrace + 1);
   }
-  return JSON.parse(text);
+
+  // 4. Пробуем распарсить
+  try {
+    return JSON.parse(text);
+  } catch (err) {
+    console.log('⚠️ Прямой JSON.parse не удался, применяем глубокую чистку кавычек...');
+    let sanitized = text.replace(/\r?\n/g, ' ');
+    return JSON.parse(sanitized);
+  }
 }
 
 // Храним валюту по пользователям (по chatId)
@@ -375,11 +384,11 @@ bot.on('photo', async (msg) => {
     const token = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 
     if (!token) {
-      return safeSendMessage(chatId, '🐗 Ошибка: Не задан TELEGRAM_BOT_TOKEN в .env!');
+      return safeSendMessage(chatId, '🐗 Ошибка: Не задан TELEGRAM_BOT_TOKEN!');
     }
 
-    // 1. Получаем путь к файлу с явным URL
-    const getFileUrl = `https://api.telegram.org/bot${token}/getFile?file_id=${photo.file_id}`;
+    // 1. Получаем путь к файлу
+    const getFileUrl = `[https://api.telegram.org/bot$](https://api.telegram.org/bot$){token}/getFile?file_id=${photo.file_id}`;
     const fileInfoRes = await axios.get(getFileUrl);
     const filePath = fileInfoRes.data?.result?.file_path;
 
@@ -388,7 +397,7 @@ bot.on('photo', async (msg) => {
     }
 
     // 2. Скачиваем оригинальный файл
-    const fileDownloadUrl = `https://api.telegram.org/file/bot${token}/${filePath}`;
+    const fileDownloadUrl = `[https://api.telegram.org/file/bot$](https://api.telegram.org/file/bot$){token}/${filePath}`;
     const imageResponse = await axios.get(fileDownloadUrl, { 
       responseType: 'arraybuffer',
       timeout: 30000 
@@ -401,7 +410,7 @@ bot.on('photo', async (msg) => {
       .toBuffer();
 
     const base64Image = compressedBuffer.toString('base64');
-    const captionText = msg.caption ? `Подпись: "${msg.caption}"` : 'Без подписи.';
+    const captionText = msg.caption ? `Подпись к чеку: "${msg.caption}"` : 'Без подписи.';
 
     const groqKey = (process.env.GROQ_API_KEY || '').trim();
 
@@ -409,28 +418,28 @@ bot.on('photo', async (msg) => {
       return safeSendMessage(chatId, '🐗 Ошибка: Не задан GROQ_API_KEY!');
     }
 
-    // 4. Запрос к Groq API
+    // 4. Запрос к Groq API с принудительным JSON-режимом
     const visionResponse = await axiosClient.post(
-      'https://api.groq.com/openai/v1/chat/completions',
+      '[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)',
       {
         model: 'qwen/qwen3.6-27b',
         reasoning_format: 'hidden',
+        response_format: { type: 'json_object' },
         temperature: 0.1,
         max_tokens: 3500,
         messages: [
           {
             role: 'system',
-            content: `Ты модуль распознавания чеков. Выдели ВСЕ товары и их цены из чека. Отвечай кратко, без размышлений.
-Верни СТРОГО валидный JSON без маркдауна и без кода \`\`\`json.
-Пиши краткие названия товаров (1-3 слова).
+            content: `Ты модуль распознавания чеков. Выдели ВСЕ товары и их цены из чека.
+Ты ДОЛЖЕН вернуть СТРОГО валидный JSON-объект без любого другого текста.
 
 ФОРМАТ JSON:
 {
   "items": [
     {
-      "name": "Краткое название",
-      "price": число,
-      "category": "Категория",
+      "name": "Краткое название (без кавычек внутри)",
+      "price": 50000,
+      "category": "Продукты",
       "type": "Общий"
     }
   ]
@@ -440,7 +449,7 @@ bot.on('photo', async (msg) => {
 Тип: "Личный" или "Общий".
 
 ПРАВИЛА ДЛЯ ВЬЕТНАМСКИХ ЧЕКОВ (VND):
-Точки и запятые — это разделители тысяч (70.000 = 70000).`
+Точки и запятые — это разделители тысяч (например, 70.000 = 70000, 1.200.000 = 1200000).`
           },
           {
             role: 'user',
@@ -466,19 +475,24 @@ bot.on('photo', async (msg) => {
     );
     
     const rawContent = visionResponse.data?.choices?.[0]?.message?.content;
+    
+    console.log('--- СЫРОЙ ОТВЕТ ОТ GROQ VISION ---');
+    console.log(rawContent);
+    console.log('----------------------------------');
+
     let data;
 
     try {
       data = cleanAndParseJSON(rawContent);
     } catch (parseErr) {
-      console.error('Ошибка парсинга JSON от Groq:', rawContent);
+      console.error('❌ Не удалось распарсить JSON. Ошибка:', parseErr.message);
       return safeSendMessage(
         chatId, 
-        '🐗 Чек слишком длинный или неразборчивый. Попробуй сфотографировать чуть ближе!'
+        '🐗 Не удалось разобрать структуру чека. Попробуй сфотографировать ровнее или ближе!'
       );
     }
     
-    if (data && data.items && data.items.length > 0) {
+    if (data && data.items && Array.isArray(data.items) && data.items.length > 0) {
       for (const item of data.items) {
         let fixedPrice = Number(item.price) || 0;
         const lowerName = (item.name || '').toLowerCase();
@@ -805,7 +819,7 @@ process.on('unhandledRejection', (reason) => {
   }
 });
 
-console.log('Бот "Кабан Финансист" успешно запущен и готов к деплою!');
+console.log('Бот "Кабан Финансист" успешно запущен и готов!');
 
 
 
