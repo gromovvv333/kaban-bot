@@ -17,6 +17,12 @@ const fs = require('fs');
 const path = require('path');
 const sharp = require('sharp');
 
+// Хелпер для жесткой очистки URL и токенов из env
+function cleanEnvVar(val) {
+  if (!val) return '';
+  return String(val).trim().replace(/^["']|["']$/g, '');
+}
+
 // Файл для автономного хранения курсов
 const RATES_FILE = path.join(__dirname, 'rates.json');
 
@@ -65,7 +71,8 @@ const axiosClient = axios.create({
   }
 });
 
-const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, {
+const botToken = cleanEnvVar(process.env.TELEGRAM_BOT_TOKEN);
+const bot = new TelegramBot(botToken, {
   polling: {
     interval: 500,
     autoStart: true,
@@ -106,11 +113,11 @@ async function safeSendMessage(chatId, text, options = {}, retries = 3) {
   }
 }
 
-// Вспомогательная функция очистки и безопасного парсинга JSON
+// Вспомогательная функция очистки и бронебойного парсинга JSON
 function cleanAndParseJSON(rawText) {
   let text = (rawText || '').trim();
   
-  // 1. Вырезаем блоки мыслей <think>...</think>, если они просочились
+  // 1. Вырезаем блоки мыслей <think>...</think>
   if (text.includes('</think>')) {
     text = text.split('</think>')[1];
   }
@@ -126,12 +133,19 @@ function cleanAndParseJSON(rawText) {
     text = text.substring(firstBrace, lastBrace + 1);
   }
 
-  // 4. Пробуем распарсить
+  // 4. Прямая попытка парсинга
   try {
     return JSON.parse(text);
   } catch (err) {
-    console.log('⚠️ Прямой JSON.parse не удался, применяем глубокую чистку кавычек...');
-    let sanitized = text.replace(/\r?\n/g, ' ');
+    console.log('⚠️ Прямой JSON.parse не удался, применяем глубинную очистку спецсимволов...');
+    
+    // Экранируем переносы строк и исправляем кавычки внутри текстовых полей
+    let sanitized = text
+      .replace(/\r?\n/g, ' ')
+      .replace(/([{,]\s*"[a-zA-Z0-9_]+"s*:\s*)"([^"]*)"/g, (match, p1, p2) => {
+        return p1 + '"' + p2.replace(/"/g, "'") + '"';
+      });
+
     return JSON.parse(sanitized);
   }
 }
@@ -153,10 +167,10 @@ const USERS = {
 
 // Функция точечного удаления конкретной траты (или последней из меню)
 async function handleDeleteExpense(chatId, userId, messageIdToDelete = null) {
-  const scriptUrl = process.env.GOOGLE_SCRIPT_URL ? process.env.GOOGLE_SCRIPT_URL.trim() : null;
-  if (!scriptUrl) {
+  const scriptUrl = cleanEnvVar(process.env.GOOGLE_SCRIPT_URL);
+  if (!scriptUrl || !scriptUrl.startsWith('http')) {
     if (messageIdToDelete) pendingDeletions.delete(messageIdToDelete);
-    return safeSendMessage(chatId, '🐗 Хрю! Не могу удалить запись, не задан GOOGLE_SCRIPT_URL!');
+    return safeSendMessage(chatId, '🐗 Хрю! Не могу удалить запись, некорректный GOOGLE_SCRIPT_URL!');
   }
 
   const numericUserId = Number(userId);
@@ -184,7 +198,7 @@ async function handleDeleteExpense(chatId, userId, messageIdToDelete = null) {
       await safeSendMessage(chatId, '🗑 *Твоя последняя трата успешно удалена из таблицы!*', { parse_mode: 'Markdown' });
     }
   } catch (err) {
-    console.log('Запрос на удаление обработан или прошёл с таймаутом.');
+    console.log('Запрос на удаление обработан или прошёл с таймаутом:', err.message);
     
     if (messageIdToDelete) {
       try {
@@ -281,7 +295,7 @@ async function processExpense(msg, data) {
     });
   } catch (e) {}
 
-  const scriptUrl = process.env.GOOGLE_SCRIPT_URL ? process.env.GOOGLE_SCRIPT_URL.trim() : null;
+  const scriptUrl = cleanEnvVar(process.env.GOOGLE_SCRIPT_URL);
   if (scriptUrl && scriptUrl.startsWith('http')) {
     try {
       const payload = {
@@ -300,6 +314,8 @@ async function processExpense(msg, data) {
     } catch (err) {
       console.error('Ошибка записи в Google Таблицу:', err.message);
     }
+  } else {
+    console.warn('⚠️ GOOGLE_SCRIPT_URL не задан или имеет некорректный формат:', scriptUrl);
   }
 }
 
@@ -312,20 +328,21 @@ async function handleAnalytics(msg) {
 
   await safeSendMessage(chatId, '🐗 *Кабан роет в таблицах и считает желуди... Секундочку!*', { parse_mode: 'Markdown' });
 
-  const scriptUrl = process.env.GOOGLE_SCRIPT_URL ? process.env.GOOGLE_SCRIPT_URL.trim() : null;
-  if (!scriptUrl) {
-    return safeSendMessage(chatId, '🐗 Хрю! Не могу прочитать таблицу, не задан GOOGLE_SCRIPT_URL!');
+  const scriptUrl = cleanEnvVar(process.env.GOOGLE_SCRIPT_URL);
+  if (!scriptUrl || !scriptUrl.startsWith('http')) {
+    return safeSendMessage(chatId, '🐗 Хрю! Не могу прочитать таблицу, некорректный GOOGLE_SCRIPT_URL!');
   }
 
   try {
     const tableDataResponse = await axiosClient.get(scriptUrl);
     const historyData = tableDataResponse.data;
 
-    const groqKey = process.env.GROQ_API_KEY ? process.env.GROQ_API_KEY.trim() : '';
+    const groqKey = cleanEnvVar(process.env.GROQ_API_KEY);
     const analyticsAiResponse = await axiosClient.post(
       '[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)',
       {
         model: 'llama-3.3-70b-versatile',
+        max_tokens: 4096,
         messages: [
           {
             role: 'system',
@@ -381,23 +398,28 @@ bot.on('photo', async (msg) => {
 
   try {
     const photo = msg.photo[msg.photo.length - 1];
-    const token = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
+    const token = cleanEnvVar(process.env.TELEGRAM_BOT_TOKEN);
 
     if (!token) {
       return safeSendMessage(chatId, '🐗 Ошибка: Не задан TELEGRAM_BOT_TOKEN!');
     }
 
-    // 1. Получаем путь к файлу
-    const getFileUrl = `[https://api.telegram.org/bot$](https://api.telegram.org/bot$){token}/getFile?file_id=${photo.file_id}`;
+    // 1. Получаем путь к файлу с экранированием URL
+    const getFileUrl = `[https://api.telegram.org/bot$](https://api.telegram.org/bot$){token}/getFile?file_id=${encodeURIComponent(photo.file_id)}`;
+    console.log('--> Запрос пути к файлу:', getFileUrl);
+
     const fileInfoRes = await axios.get(getFileUrl);
     const filePath = fileInfoRes.data?.result?.file_path;
 
     if (!filePath) {
-      throw new Error('Не удалось получить путь к файлу от Telegram API');
+      throw new Error('Telegram API не вернул file_path');
     }
 
     // 2. Скачиваем оригинальный файл
-    const fileDownloadUrl = `[https://api.telegram.org/file/bot$](https://api.telegram.org/file/bot$){token}/${filePath}`;
+    const cleanFilePath = String(filePath).trim();
+    const fileDownloadUrl = `[https://api.telegram.org/file/bot$](https://api.telegram.org/file/bot$){token}/${cleanFilePath}`;
+    console.log('--> Скачивание файла:', fileDownloadUrl);
+
     const imageResponse = await axios.get(fileDownloadUrl, { 
       responseType: 'arraybuffer',
       timeout: 30000 
@@ -412,32 +434,34 @@ bot.on('photo', async (msg) => {
     const base64Image = compressedBuffer.toString('base64');
     const captionText = msg.caption ? `Подпись к чеку: "${msg.caption}"` : 'Без подписи.';
 
-    const groqKey = (process.env.GROQ_API_KEY || '').trim();
+    const groqKey = cleanEnvVar(process.env.GROQ_API_KEY);
 
     if (!groqKey) {
       return safeSendMessage(chatId, '🐗 Ошибка: Не задан GROQ_API_KEY!');
     }
 
-    // 4. Запрос к Groq API с принудительным JSON-режимом
+    // 4. Запрос к Groq API с увеличенным запасом токенов
     const visionResponse = await axiosClient.post(
       '[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)',
       {
         model: 'qwen/qwen3.6-27b',
         reasoning_format: 'hidden',
         response_format: { type: 'json_object' },
-        temperature: 0.1,
-        max_tokens: 3500,
+        temperature: 0.0,
+        max_tokens: 4096,
         messages: [
           {
             role: 'system',
             content: `Ты модуль распознавания чеков. Выдели ВСЕ товары и их цены из чека.
-Ты ДОЛЖЕН вернуть СТРОГО валидный JSON-объект без любого другого текста.
+Ты ДОЛЖЕН вернуть СТРОГО валидный JSON-объект. Никакого текста до или после JSON.
+
+ВНИМАНИЕ К КАВЫЧКАМ: В названии товаров НЕ ИСПОЛЬЗУЙ двойные кавычки. Если в чеке написано Хлеб "Даниловский", пиши: Хлеб Даниловский.
 
 ФОРМАТ JSON:
 {
   "items": [
     {
-      "name": "Краткое название (без кавычек внутри)",
+      "name": "Краткое название без кавычек",
       "price": 50000,
       "category": "Продукты",
       "type": "Общий"
@@ -673,11 +697,11 @@ bot.on('message', async (msg) => {
     return handleDeleteExpense(chatId, userId, null);
   }
 
-  // 6. Обычный ввод трат (одновременно одной или нескольких)
+  // 6. Обычный ввод трат
   if (!text.startsWith('/')) {
     try {
       console.log(`[ТЕКСТ ВХОД]: "${text}"`);
-      const groqKey = process.env.GROQ_API_KEY ? process.env.GROQ_API_KEY.trim() : '';
+      const groqKey = cleanEnvVar(process.env.GROQ_API_KEY);
 
       const singleAiResponse = await axiosClient.post(
         '[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)',
@@ -705,7 +729,7 @@ bot.on('message', async (msg) => {
 
 ПРАВИЛА:
 1. intent: "delete" (если просит отменить/удалить), "analytics" (если просит отчёт/статистику), иначе "add_expense".
-2. В ВЕТКЕ add_expense: Сообщение может содержать КАК ОДНУ ТРАТУ, ТАК И СПИСОК ТРАТ (через запятую, новую строку или с союзом и). Выдели ВСЕ отдельные траты в массив "expenses".
+2. В ВЕТКЕ add_expense: Сообщение может содержать КАК ОДНУ ТРАТУ, ТАК И СПИСОК ТРАТ. Выдели ВСЕ отдельные траты в массив "expenses".
 3. amount: Чистое число. Тысячные разделения (100 000) объединяй в 100000.
 4. category: Из списка: Продукты, Бухло, Вкусняшки кабаньи, Транспорт, Жилье и Коммуналка, Развлечения и Отдых, Здоровье и Аптека, Покупки и Шмотки, Кафе и Рестораны, Подарки и Донаты.
 5. type: "Личный" (если есть "себе", "мне", "личный", или шмотки/аптека) иначе "Общий".`
