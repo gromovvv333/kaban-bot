@@ -39,7 +39,7 @@ bot.on('message', async (msg) => {
               content: msg.text
             }
           ],
-          response_format: { type: 'json_object' }
+          response_format: { type: 'json_object' }, reasoning_format: 'hidden'
         },
         {
           headers: {
