@@ -16,7 +16,8 @@ const fs = require('fs');
 const path = require('path');
 const sharp = require('sharp');
 
-// Очистка переменных окружения
+// ===================== Утилиты окружения =====================
+
 function cleanEnvVar(val) {
   if (!val) return '';
   return String(val).trim().replace(/^["']|["']$/g, '');
@@ -24,17 +25,16 @@ function cleanEnvVar(val) {
 
 const botToken = cleanEnvVar(process.env.TELEGRAM_BOT_TOKEN);
 const scriptUrlEnv = cleanEnvVar(process.env.GOOGLE_SCRIPT_URL);
-const groqKeyEnv = cleanEnvVar(process.env.GROQ_API_KEY);
 
-// Файл курсов
+// ===================== Курсы валют (персист в файл) =====================
+
 const RATES_FILE = path.join(__dirname, 'rates.json');
 let rates = { VND: 330, THB: 0.38 };
 
 function loadRates() {
   try {
     if (fs.existsSync(RATES_FILE)) {
-      const data = fs.readFileSync(RATES_FILE, 'utf8');
-      rates = JSON.parse(data);
+      rates = JSON.parse(fs.readFileSync(RATES_FILE, 'utf8'));
       console.log('Курсы загружены:', rates);
     } else {
       saveRates();
@@ -54,7 +54,45 @@ function saveRates() {
 
 loadRates();
 
-// Инициализация бота без перегруженных кастомных агентов
+// ===================== Состояние пользователей (тоже персист) =====================
+// Раньше userCurrencies/userStates жили только в памяти и слетали при
+// каждом рестарте процесса (например, когда Render "усыпляет" бесплатный
+// сервис). Теперь выбранная валюта переживает рестарт.
+
+const STATE_FILE = path.join(__dirname, 'state.json');
+let userCurrencies = {};
+let userStates = {};
+const pendingDeletions = new Set();
+
+function loadState() {
+  try {
+    if (fs.existsSync(STATE_FILE)) {
+      const saved = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+      userCurrencies = saved.userCurrencies || {};
+      userStates = saved.userStates || {};
+      console.log('Состояние пользователей загружено');
+    }
+  } catch (err) {
+    console.error('Ошибка чтения state.json:', err.message);
+  }
+}
+
+function saveState() {
+  try {
+    fs.writeFileSync(
+      STATE_FILE,
+      JSON.stringify({ userCurrencies, userStates }, null, 2),
+      'utf8'
+    );
+  } catch (err) {
+    console.error('Ошибка сохранения state.json:', err.message);
+  }
+}
+
+loadState();
+
+// ===================== Инициализация бота =====================
+
 const bot = new TelegramBot(botToken, {
   polling: {
     interval: 500,
@@ -79,22 +117,24 @@ async function safeSendMessage(chatId, text, options = {}, retries = 3) {
         delete options.parse_mode;
         return await bot.sendMessage(chatId, text, options);
       } else {
+        console.error('safeSendMessage не смог отправить сообщение:', err.message);
         throw err;
       }
     }
   }
 }
 
-// Глубокий парсер и чистильщик JSON для нейросетей
+// ===================== Парсер JSON от нейросетей =====================
+
 function cleanAndParseJSON(rawText) {
   let text = (rawText || '').trim();
-  
+
   if (text.includes('</think>')) {
     text = text.split('</think>')[1];
   }
   text = text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
   text = text.replace(/^```json\s*/i, '').replace(/^```\s*/, '').replace(/\s*```$/, '').trim();
-  
+
   const firstBrace = text.indexOf('{');
   const lastBrace = text.lastIndexOf('}');
   if (firstBrace !== -1 && lastBrace !== -1) {
@@ -107,7 +147,7 @@ function cleanAndParseJSON(rawText) {
     console.log('⚠️ Применяется доп. очистка кавычек и переносов...');
     let sanitized = text
       .replace(/\r?\n/g, ' ')
-      .replace(/([{,]\s*"[a-zA-Z0-9_]+"s*:\s*)"([^"]*)"/g, (match, p1, p2) => {
+      .replace(/([{,]\s*"[a-zA-Z0-9_]+"\s*:\s*)"([^"]*)"/g, (match, p1, p2) => {
         return p1 + '"' + p2.replace(/"/g, "'") + '"';
       });
 
@@ -115,16 +155,70 @@ function cleanAndParseJSON(rawText) {
   }
 }
 
-const userCurrencies = {};
-const userStates = {};
-const pendingDeletions = new Set();
+// ===================== Единая точка вызова Groq =====================
+// Раньше было 3 почти одинаковых axios.post блока с ручным дублированием
+// заголовков/URL — в двух из них URL был битым (markdown-ссылка вида
+// "[https://...](https://...)" вместо чистого https://...), из-за чего
+// аналитика и разбор свободного текста падали с ошибкой. Теперь URL и
+// логика запроса в одном месте.
+
+const GROQ_CHAT_URL = 'https://api.groq.com/openai/v1/chat/completions';
+
+async function callGroq({ model, system, userContent, temperature, maxTokens, timeout = 20000, extra = {} }) {
+  const groqKey = cleanEnvVar(process.env.GROQ_API_KEY);
+  if (!groqKey) {
+    throw new Error('GROQ_API_KEY не задан в переменных окружения');
+  }
+
+  const messages = [];
+  if (system) messages.push({ role: 'system', content: system });
+  messages.push({ role: 'user', content: userContent });
+
+  const payload = { model, messages, ...extra };
+  if (temperature !== undefined) payload.temperature = temperature;
+  if (maxTokens !== undefined) payload.max_tokens = maxTokens;
+
+  const response = await axios.post(GROQ_CHAT_URL, payload, {
+    headers: {
+      'Authorization': `Bearer ${groqKey}`,
+      'Content-Type': 'application/json'
+    },
+    timeout
+  });
+
+  return response.data?.choices?.[0]?.message?.content;
+}
+
+// ===================== Общие справочники =====================
+// Раньше список категорий был прописан только в промпте распознавания
+// чеков, а в промпте разбора свободного текста его не было — из-за этого
+// при ручном вводе трата могла получить категорию, которой нет в
+// выпадающем списке таблицы. Теперь один источник правды.
+
+const CATEGORIES = [
+  'Продукты', 'Бухло', 'Вкусняшки кабаньи', 'Транспорт',
+  'Жилье и Коммуналка', 'Развлечения и Отдых', 'Здоровье и Аптека',
+  'Покупки и Шмотки', 'Кафе и Рестораны', 'Подарки и Донаты'
+];
+const EXPENSE_TYPES = ['Личный', 'Общий'];
+
+// Слова, для которых нужно сработать "фикс" завышенной цены с чека
+// (модель иногда путает разряды и возвращает 1 500 000 вместо 15 000).
+// Проверяем ЦЕЛЫЕ слова, а не подстроки — раньше "вод" матчил и "водку".
+const SMALL_ITEM_WORDS = ['вода', 'кофе', 'чай', 'чипсы', 'пиво'];
+
+function isSmallItem(name) {
+  const words = (name || '').toLowerCase().split(/[^а-яёa-z0-9]+/i).filter(Boolean);
+  return words.some((w) => SMALL_ITEM_WORDS.includes(w));
+}
 
 const USERS = {
   336595543: 'Главный кабан',
   333816615: 'Кабанка'
 };
 
-// Функция удаления
+// ===================== Удаление траты =====================
+
 async function handleDeleteExpense(chatId, userId, messageIdToDelete = null) {
   const scriptUrl = cleanEnvVar(process.env.GOOGLE_SCRIPT_URL);
   if (!scriptUrl || !scriptUrl.startsWith('http')) {
@@ -150,11 +244,14 @@ async function handleDeleteExpense(chatId, userId, messageIdToDelete = null) {
           message_id: messageIdToDelete,
           parse_mode: 'Markdown'
         });
-      } catch (e) {}
+      } catch (e) {
+        console.error('Не удалось отредактировать сообщение при удалении:', e.message);
+      }
     } else {
       await safeSendMessage(chatId, '🗑 *Последняя трата удалена из таблицы!*', { parse_mode: 'Markdown' });
     }
   } catch (err) {
+    console.error('Ошибка удаления траты в Google Таблице:', err.message);
     if (messageIdToDelete) {
       try {
         await bot.editMessageText('❌ *Эта трата отменена.*', {
@@ -162,7 +259,9 @@ async function handleDeleteExpense(chatId, userId, messageIdToDelete = null) {
           message_id: messageIdToDelete,
           parse_mode: 'Markdown'
         });
-      } catch (e) {}
+      } catch (e) {
+        console.error('Не удалось отредактировать сообщение после ошибки удаления:', e.message);
+      }
     } else {
       await safeSendMessage(chatId, '🗑 *Твой запрос на удаление обработан!*', { parse_mode: 'Markdown' });
     }
@@ -183,26 +282,38 @@ function sendMainMenu(chatId) {
   });
 }
 
-// Запись траты
+// ===================== Запись траты =====================
+
 async function processExpense(msg, data) {
   const userId = msg.from.id;
   const chatId = msg.chat.id;
-  
+
   const numericUserId = Number(userId);
   const kabanName = USERS[numericUserId] || USERS[userId] || 'Главный кабан';
   const currentCurr = userCurrencies[chatId] || 'VND';
-  
-  const rawAmount = Number(data.amount) || 0;
+
+  const rawAmount = Number(data.amount);
+
+  // Раньше NaN/отрицательные/нулевые суммы молча превращались в 0 и всё
+  // равно летели в таблицу. Теперь такие траты отбрасываются с понятным
+  // сообщением.
+  if (!Number.isFinite(rawAmount) || rawAmount <= 0) {
+    await safeSendMessage(
+      chatId,
+      `🐗 Не смог разобрать сумму для "${data.description || 'позиции'}" — пропускаю её.`
+    );
+    return;
+  }
+
   let amountRub = rawAmount;
-  
   if (currentCurr === 'VND') {
     amountRub = rawAmount / (rates.VND || 330);
   } else if (currentCurr === 'THB') {
     amountRub = rawAmount / (rates.THB || 0.38);
   }
-  
+
   const currencySymbols = { RUB: '₽', VND: '₫', THB: '฿' };
-  
+
   let greetingHeader = '';
   if (kabanName === 'Главный кабан') {
     const headers = [
@@ -244,7 +355,9 @@ async function processExpense(msg, data) {
       chat_id: chatId,
       message_id: sentMessageId
     });
-  } catch (e) {}
+  } catch (e) {
+    console.error('Не удалось добавить кнопку отмены:', e.message);
+  }
 
   const scriptUrl = cleanEnvVar(process.env.GOOGLE_SCRIPT_URL);
   if (scriptUrl && scriptUrl.startsWith('http')) {
@@ -266,7 +379,8 @@ async function processExpense(msg, data) {
   }
 }
 
-// Аналитика
+// ===================== Аналитика =====================
+
 async function handleAnalytics(msg) {
   const userId = msg.from.id;
   const chatId = msg.chat.id;
@@ -283,37 +397,21 @@ async function handleAnalytics(msg) {
   try {
     const tableDataResponse = await axios.get(scriptUrl, { timeout: 15000 });
     const historyData = tableDataResponse.data;
-    const groqKey = cleanEnvVar(process.env.GROQ_API_KEY);
 
-    const analyticsAiResponse = await axios.post(
-      '[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)',
-      {
-        model: 'llama-3.3-70b-versatile',
-        max_tokens: 4096,
-        messages: [
-          {
-            role: 'system',
-            content: `Ты — харизматичный финансовый аналитик "Кабан Финансист". Пользователь: "${kabanName}".
+    const aiAnalyticsAnswer = await callGroq({
+      model: 'llama-3.3-70b-versatile',
+      maxTokens: 4096,
+      system: `Ты — харизматичный финансовый аналитик "Кабан Финансист". Пользователь: "${kabanName}".
 История трат в JSON: ${JSON.stringify(historyData)}.
 
 ПРАВИЛА:
 1. НИКОГДА НЕ ИСПОЛЬЗУЙ РЕШЁТКИ (#, ##) для заголовков!
 2. Для заголовков используй ЭМОДЗИ + ЖИРНЫЙ ТЕКСТ.
-3. Пиши с кабанским юмором.`
-          },
-          { role: 'user', content: msg.text || 'Покажи аналитику трат' }
-        ]
-      },
-      {
-        headers: {
-          'Authorization': `Bearer ${groqKey}`,
-          'Content-Type': 'application/json'
-        },
-        timeout: 30000
-      }
-    );
+3. Пиши с кабанским юмором.`,
+      userContent: msg.text || 'Покажи аналитику трат',
+      timeout: 30000
+    });
 
-    const aiAnalyticsAnswer = analyticsAiResponse.data.choices[0].message.content;
     return await safeSendMessage(chatId, aiAnalyticsAnswer, { parse_mode: 'Markdown' });
   } catch (error) {
     console.error('Ошибка аналитики:', error.message);
@@ -321,13 +419,16 @@ async function handleAnalytics(msg) {
   }
 }
 
-// Обработка Фото (Чеков)
+// ===================== Обработка фото (чеков) =====================
+
 bot.on('photo', async (msg) => {
   const chatId = msg.chat.id;
 
   try {
     await bot.sendChatAction(chatId, 'typing');
-  } catch (e) {}
+  } catch (e) {
+    console.error('sendChatAction упал:', e.message);
+  }
 
   try {
     if (!msg.photo || !Array.isArray(msg.photo) || msg.photo.length === 0) {
@@ -339,7 +440,7 @@ bot.on('photo', async (msg) => {
     const fileId = photo.file_id;
 
     if (!fileId || typeof fileId !== 'string') {
-      console.error('❌ КРИТИЧЕСКАЯ ОШИБКА: file_id не является строкой!', photo);
+      console.error('❌ file_id не является строкой!', photo);
       return safeSendMessage(chatId, '🐗 Ошибка: Некорректный ID файла от Telegram.');
     }
 
@@ -350,7 +451,7 @@ bot.on('photo', async (msg) => {
 
     // 1. Получаем путь к файлу напрямую через Telegram API
     const getFileApiUrl = `https://api.telegram.org/bot${token}/getFile?file_id=${encodeURIComponent(fileId)}`;
-    
+
     const fileRes = await fetch(getFileApiUrl);
     const fileData = await fileRes.json();
 
@@ -361,13 +462,11 @@ bot.on('photo', async (msg) => {
 
     const cleanFilePath = String(fileData.result.file_path).trim();
     const downloadUrl = `https://api.telegram.org/file/bot${token}/${cleanFilePath}`;
-    
-    console.log('--> Ссылка на скачивание успешно собрана:', downloadUrl);
 
-    // 2. Скачиваем файл через axios как бинарник
-    const imageResponse = await axios.get(downloadUrl, { 
+    // 2. Скачиваем файл
+    const imageResponse = await axios.get(downloadUrl, {
       responseType: 'arraybuffer',
-      timeout: 30000 
+      timeout: 30000
     });
 
     // 3. Оптимизация через sharp
@@ -378,24 +477,17 @@ bot.on('photo', async (msg) => {
 
     const base64Image = compressedBuffer.toString('base64');
     const captionText = msg.caption ? `Подпись к чеку: "${msg.caption}"` : 'Без подписи.';
-    const groqKey = cleanEnvVar(process.env.GROQ_API_KEY);
 
-    if (!groqKey) {
-      return safeSendMessage(chatId, '🐗 Ошибка: Не задан GROQ_API_KEY!');
-    }
-
-    // 4. Запрос к Groq Vision с переносом названий на русский язык
-    const visionResponse = await axios.post(
-      'https://api.groq.com/openai/v1/chat/completions',
-      {
-        model: 'qwen/qwen3.6-27b',
-        reasoning_format: 'hidden',
-        temperature: 0.1,
-        max_tokens: 4096,
-        messages: [
-          {
-            role: 'system',
-            content: `Ты модуль распознавания чеков. Выдели ВСЕ товары и цены.
+    // 4. Запрос к Groq Vision (qwen3.6-27b — держим её осознанно, т.к.
+    // это бесплатный тариф Groq; при желании потом можно добавить fallback
+    // на другую модель, если эта станет недоступна).
+    const rawContent = await callGroq({
+      model: 'qwen/qwen3.6-27b',
+      temperature: 0.1,
+      maxTokens: 4096,
+      timeout: 60000,
+      extra: { reasoning_format: 'hidden' },
+      system: `Ты модуль распознавания чеков. Выдели ВСЕ товары и цены.
 ОБЯЗАТЕЛЬНО ПЕРЕВОДИ все названия товаров на РУССКИЙ ЯЗЫК (например: "Thịt heo" -> "Свинина", "Cà phê" -> "Кофе", "Water" -> "Вода", "Bánh mì" -> "Хлеб").
 
 Верни СТРОГО валидный JSON-объект без пояснений.
@@ -414,44 +506,29 @@ bot.on('photo', async (msg) => {
   ]
 }
 
-Категории: Продукты, Бухло, Вкусняшки кабаньи, Транспорт, Жилье и Коммуналка, Развлечения и Отдых, Здоровье и Аптека, Покупки и Шмотки, Кафе и Рестораны, Подарки и Донаты.
-Тип: "Личный" или "Общий".`
-          },
-          {
-            role: 'user',
-            content: [
-              { type: 'text', text: captionText },
-              {
-                type: 'image_url',
-                image_url: { url: `data:image/jpeg;base64,${base64Image}` }
-              }
-            ]
-          }
-        ]
-      },
-      {
-        headers: {
-          'Authorization': `Bearer ${groqKey}`,
-          'Content-Type': 'application/json'
-        },
-        timeout: 60000
-      }
-    );
-    
-    const rawContent = visionResponse.data?.choices?.[0]?.message?.content;
+Категории: ${CATEGORIES.join(', ')}.
+Тип: "${EXPENSE_TYPES.join('" или "')}".`,
+      userContent: [
+        { type: 'text', text: captionText },
+        {
+          type: 'image_url',
+          image_url: { url: `data:image/jpeg;base64,${base64Image}` }
+        }
+      ]
+    });
+
     let data = cleanAndParseJSON(rawContent);
-    
+
     if (data && data.items && Array.isArray(data.items) && data.items.length > 0) {
+      let addedCount = 0;
       for (const item of data.items) {
         let fixedPrice = Number(item.price) || 0;
-        const lowerName = (item.name || '').toLowerCase();
 
-        const isSmallItem = lowerName.includes('вод') || lowerName.includes('кофе') || 
-                            lowerName.includes('чай') || lowerName.includes('чипсы') || lowerName.includes('пиво');
-
-        if (isSmallItem && fixedPrice > 500000) {
+        if (isSmallItem(item.name) && fixedPrice > 500000) {
           fixedPrice = Math.round(fixedPrice / 1000);
         }
+
+        if (fixedPrice <= 0) continue;
 
         await processExpense(msg, {
           amount: fixedPrice,
@@ -459,6 +536,11 @@ bot.on('photo', async (msg) => {
           description: item.name || 'Покупка по чеку',
           type: item.type || 'Общий'
         });
+        addedCount++;
+      }
+
+      if (addedCount === 0) {
+        safeSendMessage(chatId, '🐗 На чеке нашлись позиции, но ни у одной не разобралась цена.');
       }
     } else {
       safeSendMessage(chatId, '🐗 Кабан не смог разглядеть позиций на чеке.');
@@ -471,17 +553,23 @@ bot.on('photo', async (msg) => {
   }
 });
 
-// Инлайн-кнопки
+// ===================== Инлайн-кнопки =====================
+
 bot.on('callback_query', async (query) => {
   const chatId = query.message.chat.id;
   const userId = query.from.id;
 
-  try { await bot.answerCallbackQuery(query.id); } catch (e) {}
+  try {
+    await bot.answerCallbackQuery(query.id);
+  } catch (e) {
+    console.error('answerCallbackQuery упал:', e.message);
+  }
 
   if (query.data.startsWith('CURRENCY_')) {
     const currency = query.data.split('_')[1];
     userCurrencies[chatId] = currency;
-    
+    saveState();
+
     let rateInfo = '';
     if (currency === 'VND') rateInfo = `\nТекущий делитель курса: **${rates.VND || 330}**`;
     if (currency === 'THB') rateInfo = `\nТекущий делитель курса: **${rates.THB || 0.38}**`;
@@ -499,13 +587,16 @@ bot.on('callback_query', async (query) => {
         message_id: targetMsgId,
         parse_mode: 'Markdown'
       });
-    } catch (e) {}
+    } catch (e) {
+      console.error('Не удалось показать "удаляю...":', e.message);
+    }
 
     await handleDeleteExpense(chatId, userId, targetMsgId);
   }
 });
 
-// Обработчик текста
+// ===================== Обработчик текста =====================
+
 bot.on('message', async (msg) => {
   if (!msg.text) return;
 
@@ -515,6 +606,8 @@ bot.on('message', async (msg) => {
 
   if (userStates[chatId] === 'AWAITING_RATE') {
     delete userStates[chatId];
+    saveState();
+
     const newRate = parseFloat(text.replace(',', '.'));
     if (isNaN(newRate) || newRate <= 0) {
       return safeSendMessage(chatId, '❌ Некорректное число.');
@@ -549,6 +642,7 @@ bot.on('message', async (msg) => {
       return safeSendMessage(chatId, '🐗 Переключи валюту на VND или THB.');
     }
     userStates[chatId] = 'AWAITING_RATE';
+    saveState();
     return safeSendMessage(chatId, `⚙️ Введи новый делитель для **${currentCurr}**:`, { parse_mode: 'Markdown' });
   }
 
@@ -558,15 +652,10 @@ bot.on('message', async (msg) => {
   // Обработка текстовой траты
   if (!text.startsWith('/')) {
     try {
-      const groqKey = cleanEnvVar(process.env.GROQ_API_KEY);
-      const singleAiResponse = await axios.post(
-        '[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)',
-        {
-          model: 'llama-3.3-70b-versatile',
-          messages: [
-            {
-              role: 'system',
-              content: `Разбери сообщение и верни СТРОГО JSON.
+      const rawContent = await callGroq({
+        model: 'llama-3.3-70b-versatile',
+        timeout: 15000,
+        system: `Разбери сообщение и верни СТРОГО JSON.
 {
   "intent": "add_expense" | "delete" | "analytics",
   "expenses": [
@@ -577,21 +666,14 @@ bot.on('message', async (msg) => {
       "type": "Общий" | "Личный"
     }
   ]
-}`
-            },
-            { role: 'user', content: text }
-          ]
-        },
-        {
-          headers: {
-            'Authorization': `Bearer ${groqKey}`,
-            'Content-Type': 'application/json'
-          },
-          timeout: 15000
-        }
-      );
+}
 
-      let parsed = cleanAndParseJSON(singleAiResponse.data.choices[0].message.content);
+Категории: ${CATEGORIES.join(', ')}.
+Тип: "${EXPENSE_TYPES.join('" или "')}".`,
+        userContent: text
+      });
+
+      let parsed = cleanAndParseJSON(rawContent);
 
       if (parsed.intent === 'analytics') return handleAnalytics(msg);
       if (parsed.intent === 'delete') return handleDeleteExpense(chatId, userId, null);
