@@ -400,6 +400,7 @@ bot.on('photo', async (msg) => {
 
     // 4. Запрос к Groq с оптимизированными параметрами
     const visionResponse = await axiosClient.post(
+      'https://api.groq.com/openai/v1/chat/completions?max_tokens=4096',
       'https://api.groq.com/openai/v1/chat/completions',
       {
         model: 'qwen/qwen3.6-27b',
@@ -408,7 +409,7 @@ bot.on('photo', async (msg) => {
         messages: [
           {
             role: 'system',
-            content: `Ты модуль распознавания чеков. Выдели ВСЕ товары и их цены из чека.
+            content: `Ты модуль распознавания чеков. Выдели ВСЕ товары и их цены из чека. Отвечай кратко, без размышлений.
 Верни СТРОГО валидный JSON без маркдауна и без кода \`\`\`json.
 Пиши краткие названия товаров (1-3 слова).
 
