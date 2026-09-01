@@ -391,26 +391,25 @@ bot.on('photo', async (msg) => {
       return safeSendMessage(chatId, '🐗 Ошибка: Не задан GROQ_API_KEY!');
     }
 
-    // 3. Запрос к Groq с полным разбором всех позиций
+    // 3. Быстрый и сжатый запрос к Groq
     const visionResponse = await axiosClient.post(
       'https://api.groq.com/openai/v1/chat/completions',
       {
         model: 'qwen/qwen3.6-27b',
         reasoning_format: 'hidden',
-        max_tokens: 3072, // Запас длины ответа для длинных чеков
+        temperature: 0.1,
+        max_tokens: 2500,
         messages: [
           {
             role: 'system',
-            content: `Ты модуль распознавания чеков. Проанализируй фото и перечисли ВСЕ товары и позиции из чека по отдельности.
-
-Верни СТРОГО валидный JSON без маркдауна и без кода \`\`\`json.
-Названия товаров давай краткие и понятные на русском языке (без длинных юридических наименований).
+            content: `Ты модуль распознавания чеков. Выдели ВСЕ товары и их цены.
+Верни СТРОГО валидный JSON без маркдауна и без кода \`\`\`json. Пиши максимально краткие названия (1-3 слова).
 
 ФОРМАТ JSON:
 {
   "items": [
     {
-      "name": "Название на русском",
+      "name": "Краткое название",
       "price": число,
       "category": "Категория",
       "type": "Общий"
@@ -490,7 +489,7 @@ bot.on('photo', async (msg) => {
     const errorDetails = error.response?.data?.error?.message || error.message || String(error);
     console.error('Ошибка обработки фото:', errorDetails);
 
-    if (error.response?.data?.error?.code === 'rate_limit_exceeded') {
+    if (error.response?.data?.error?.code === 'rate_limit_exceeded' || errorDetails.includes('rate_limit')) {
       return safeSendMessage(
         chatId, 
         '🐗 *Кабан слишком быстро разглядывал чеки!* Лимит нейросети превышен.\n\nПодожди 15 секунд и отправь чек снова!', 
