@@ -338,7 +338,6 @@ bot.on('photo', async (msg) => {
     const photo = msg.photo[msg.photo.length - 1];
     const fileId = photo.file_id;
 
-    // ПРОВЕРКА 1: Проверяем, что file_id вообще существует и это строка
     if (!fileId || typeof fileId !== 'string') {
       console.error('❌ КРИТИЧЕСКАЯ ОШИБКА: file_id не является строкой!', photo);
       return safeSendMessage(chatId, '🐗 Ошибка: Некорректный ID файла от Telegram.');
@@ -352,7 +351,6 @@ bot.on('photo', async (msg) => {
     // 1. Получаем путь к файлу напрямую через Telegram API
     const getFileApiUrl = `https://api.telegram.org/bot${token}/getFile?file_id=${encodeURIComponent(fileId)}`;
     
-    // Используем нативный fetch Node.js вместо сторонних библиотек
     const fileRes = await fetch(getFileApiUrl);
     const fileData = await fileRes.json();
 
@@ -386,7 +384,7 @@ bot.on('photo', async (msg) => {
       return safeSendMessage(chatId, '🐗 Ошибка: Не задан GROQ_API_KEY!');
     }
 
-    // 4. Запрос к Groq Vision
+    // 4. Запрос к Groq Vision с переносом названий на русский язык
     const visionResponse = await axios.post(
       'https://api.groq.com/openai/v1/chat/completions',
       {
@@ -398,6 +396,8 @@ bot.on('photo', async (msg) => {
           {
             role: 'system',
             content: `Ты модуль распознавания чеков. Выдели ВСЕ товары и цены.
+ОБЯЗАТЕЛЬНО ПЕРЕВОДИ все названия товаров на РУССКИЙ ЯЗЫК (например: "Thịt heo" -> "Свинина", "Cà phê" -> "Кофе", "Water" -> "Вода", "Bánh mì" -> "Хлеб").
+
 Верни СТРОГО валидный JSON-объект без пояснений.
 
 ВНИМАНИЕ: В названиях товаров НЕ используй двойные кавычки.
@@ -406,7 +406,7 @@ bot.on('photo', async (msg) => {
 {
   "items": [
     {
-      "name": "Название товара",
+      "name": "Название товара на русском",
       "price": 50000,
       "category": "Продукты",
       "type": "Общий"
@@ -446,7 +446,7 @@ bot.on('photo', async (msg) => {
         let fixedPrice = Number(item.price) || 0;
         const lowerName = (item.name || '').toLowerCase();
 
-        const isSmallItem = lowerName.includes('вод') || lowerName.includes('water') || lowerName.includes('кофе') || 
+        const isSmallItem = lowerName.includes('вод') || lowerName.includes('кофе') || 
                             lowerName.includes('чай') || lowerName.includes('чипсы') || lowerName.includes('пиво');
 
         if (isSmallItem && fixedPrice > 500000) {
