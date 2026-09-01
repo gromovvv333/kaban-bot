@@ -366,7 +366,7 @@ bot.on('photo', async (msg) => {
     const photo = msg.photo[msg.photo.length - 1]; // Берем фото в самом высоком разрешении
     const token = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 
-    // 1. Получаем путь к файлу прямо через Telegram API
+    // 1. Получаем путь к файлу через Telegram API
     const fileInfoRes = await axios.get(`https://api.telegram.org/bot${token}/getFile?file_id=${photo.file_id}`);
     const filePath = fileInfoRes.data?.result?.file_path;
 
@@ -374,7 +374,7 @@ bot.on('photo', async (msg) => {
       throw new Error('Не удалось получить путь к фото от Telegram API');
     }
 
-    // 2. Скачиваем сам файл по строго сформированному URL
+    // 2. Скачиваем файл
     const fileDownloadUrl = `https://api.telegram.org/file/bot${token}/${filePath}`;
     
     const imageResponse = await axios.get(fileDownloadUrl, { 
@@ -391,20 +391,26 @@ bot.on('photo', async (msg) => {
       return safeSendMessage(chatId, '🐗 Ошибка: Не задан GROQ_API_KEY!');
     }
 
-    // 3. Отправляем в Groq Vision (Qwen)
-    const visionResponse = await axios.post(
+    // 3. Запрос к Groq с полным разбором всех позиций
+    const visionResponse = await axiosClient.post(
       'https://api.groq.com/openai/v1/chat/completions',
       {
         model: 'qwen/qwen3.6-27b',
         reasoning_format: 'hidden',
+        max_tokens: 3072, // Запас длины ответа для длинных чеков
         messages: [
           {
             role: 'system',
-            content: `Верни СТРОГО валидный JSON в таком формате, без лишнего текста и без блоков кода:
+            content: `Ты модуль распознавания чеков. Проанализируй фото и перечисли ВСЕ товары и позиции из чека по отдельности.
+
+Верни СТРОГО валидный JSON без маркдауна и без кода \`\`\`json.
+Названия товаров давай краткие и понятные на русском языке (без длинных юридических наименований).
+
+ФОРМАТ JSON:
 {
   "items": [
     {
-      "name": "название на русском",
+      "name": "Название на русском",
       "price": число,
       "category": "Категория",
       "type": "Общий"
@@ -416,7 +422,7 @@ bot.on('photo', async (msg) => {
 Тип: "Личный" или "Общий".
 
 ПРАВИЛА ДЛЯ ВЬЕТНАМСКИХ ЧЕКОВ (VND):
-Точки и запятые — это разделители тысяч (7.000 = 7 000, а не 7 миллионов). Вода, кофе и мелкие продукты не стоят миллионы.`
+Точки и запятые — это разделители тысяч (70.000 = 70000).`
           },
           {
             role: 'user',
@@ -442,9 +448,19 @@ bot.on('photo', async (msg) => {
     );
     
     const rawContent = visionResponse.data?.choices?.[0]?.message?.content;
-    const data = cleanAndParseJSON(rawContent);
+    let data;
+
+    try {
+      data = cleanAndParseJSON(rawContent);
+    } catch (parseErr) {
+      console.error('Ошибка парсинга JSON от Groq:', rawContent);
+      return safeSendMessage(
+        chatId, 
+        '🐗 Чек слишком огромный или плохо виден. Попробуй сфотографировать чуть ближе или разбить на два кадра!'
+      );
+    }
     
-    if (data.items && data.items.length > 0) {
+    if (data && data.items && data.items.length > 0) {
       for (const item of data.items) {
         let fixedPrice = Number(item.price) || 0;
         const lowerName = (item.name || '').toLowerCase();
@@ -462,7 +478,7 @@ bot.on('photo', async (msg) => {
         await processExpense(msg, {
           amount: fixedPrice,
           category: item.category || 'Продукты',
-          description: item.name || 'Товар с чека',
+          description: item.name || 'Покупка по чеку',
           type: item.type || 'Общий'
         });
       }
