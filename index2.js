@@ -354,6 +354,8 @@ async function handleAnalytics(msg) {
   }
 }
 
+const sharp = require('sharp'); // Убедись, что require('sharp') есть в начале файла!
+
 // Обработчик фото сообщений (чеков)
 bot.on('photo', async (msg) => {
   const chatId = msg.chat.id;
@@ -363,27 +365,32 @@ bot.on('photo', async (msg) => {
   } catch (e) {}
 
   try {
-    const photo = msg.photo[msg.photo.length - 1]; // Берем фото в самом высоком разрешении
+    const photo = msg.photo[msg.photo.length - 1];
     const token = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 
-    // 1. Получаем путь к файлу через Telegram API
+    // 1. Получаем путь к файлу
     const fileInfoRes = await axios.get(`https://api.telegram.org/bot${token}/getFile?file_id=${photo.file_id}`);
     const filePath = fileInfoRes.data?.result?.file_path;
 
     if (!filePath) {
-      throw new Error('Не удалось получить путь к фото от Telegram API');
+      throw new Error('Не удалось получить путь к фото');
     }
 
-    // 2. Скачиваем файл
+    // 2. Скачиваем оригинальный файл
     const fileDownloadUrl = `https://api.telegram.org/file/bot${token}/${filePath}`;
-    
     const imageResponse = await axios.get(fileDownloadUrl, { 
       responseType: 'arraybuffer',
       timeout: 30000 
     });
-    
-    const base64Image = Buffer.from(imageResponse.data, 'binary').toString('base64');
-    const captionText = msg.caption ? `Подпись от пользователя к фото: "${msg.caption}"` : 'Подписи нет.';
+
+    // 3. Сжимаем через sharp (режет входные токены в 4-5 раз!)
+    const compressedBuffer = await sharp(imageResponse.data)
+      .resize(1024, 1024, { fit: 'inside', withoutEnlargement: true })
+      .jpeg({ quality: 80 })
+      .toBuffer();
+
+    const base64Image = compressedBuffer.toString('base64');
+    const captionText = msg.caption ? `Подпись: "${msg.caption}"` : 'Без подписи.';
 
     const groqKey = (process.env.GROQ_API_KEY || '').trim();
 
@@ -391,19 +398,19 @@ bot.on('photo', async (msg) => {
       return safeSendMessage(chatId, '🐗 Ошибка: Не задан GROQ_API_KEY!');
     }
 
-    // 3. Быстрый и сжатый запрос к Groq
+    // 4. Запрос к Groq с оптимизированными параметрами
     const visionResponse = await axiosClient.post(
       'https://api.groq.com/openai/v1/chat/completions',
       {
         model: 'qwen/qwen3.6-27b',
-        reasoning_format: 'hidden',
         temperature: 0.1,
-        max_tokens: 2500,
+        max_tokens: 2000,
         messages: [
           {
             role: 'system',
-            content: `Ты модуль распознавания чеков. Выдели ВСЕ товары и их цены.
-Верни СТРОГО валидный JSON без маркдауна и без кода \`\`\`json. Пиши максимально краткие названия (1-3 слова).
+            content: `Ты модуль распознавания чеков. Выдели ВСЕ товары и их цены из чека.
+Верни СТРОГО валидный JSON без маркдауна и без кода \`\`\`json.
+Пиши краткие названия товаров (1-3 слова).
 
 ФОРМАТ JSON:
 {
@@ -455,7 +462,7 @@ bot.on('photo', async (msg) => {
       console.error('Ошибка парсинга JSON от Groq:', rawContent);
       return safeSendMessage(
         chatId, 
-        '🐗 Чек слишком огромный или плохо виден. Попробуй сфотографировать чуть ближе или разбить на два кадра!'
+        '🐗 Чек слишком длинный или неразборчивый. Попробуй сфотографировать чуть ближе или разбить на два кадра!'
       );
     }
     
@@ -489,10 +496,10 @@ bot.on('photo', async (msg) => {
     const errorDetails = error.response?.data?.error?.message || error.message || String(error);
     console.error('Ошибка обработки фото:', errorDetails);
 
-    if (error.response?.data?.error?.code === 'rate_limit_exceeded' || errorDetails.includes('rate_limit')) {
+    if (errorDetails.includes('rate_limit') || errorDetails.includes('TPM') || error.response?.data?.error?.code === 'rate_limit_exceeded') {
       return safeSendMessage(
         chatId, 
-        '🐗 *Кабан слишком быстро разглядывал чеки!* Лимит нейросети превышен.\n\nПодожди 15 секунд и отправь чек снова!', 
+        '🐗 *Кабан упёрся в лимит нейросети!* Подожди 10-15 секунд и отправь чек снова.', 
         { parse_mode: 'Markdown' }
       );
     }
