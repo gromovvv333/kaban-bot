@@ -15,6 +15,7 @@ const axios = require('axios');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
+const sharp = require('sharp');
 
 // Файл для автономного хранения курсов
 const RATES_FILE = path.join(__dirname, 'rates.json');
@@ -108,7 +109,14 @@ async function safeSendMessage(chatId, text, options = {}, retries = 3) {
 // Вспомогательная функция очистки и безопасного парсинга JSON
 function cleanAndParseJSON(rawText) {
   let text = (rawText || '').trim();
+  
+  // Вырезаем блоки мыслей <think>...</think>
+  if (text.includes('</think>')) {
+    text = text.split('</think>')[1];
+  }
   text = text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+  
+  // Очищаем маркдаун
   text = text.replace(/^```json\s*/i, '').replace(/^```\s*/, '').replace(/\s*```$/, '').trim();
   
   const firstBrace = text.indexOf('{');
@@ -354,8 +362,6 @@ async function handleAnalytics(msg) {
   }
 }
 
-const sharp = require('sharp'); // Убедись, что require('sharp') есть в начале файла!
-
 // Обработчик фото сообщений (чеков)
 bot.on('photo', async (msg) => {
   const chatId = msg.chat.id;
@@ -369,7 +375,7 @@ bot.on('photo', async (msg) => {
     const token = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 
     // 1. Получаем путь к файлу
-    const fileInfoRes = await axios.get(`https://api.telegram.org/bot${token}/getFile?file_id=${photo.file_id}`);
+    const fileInfoRes = await axios.get(`[https://api.telegram.org/bot$](https://api.telegram.org/bot$){token}/getFile?file_id=${photo.file_id}`);
     const filePath = fileInfoRes.data?.result?.file_path;
 
     if (!filePath) {
@@ -377,13 +383,13 @@ bot.on('photo', async (msg) => {
     }
 
     // 2. Скачиваем оригинальный файл
-    const fileDownloadUrl = `https://api.telegram.org/file/bot${token}/${filePath}`;
+    const fileDownloadUrl = `[https://api.telegram.org/file/bot$](https://api.telegram.org/file/bot$){token}/${filePath}`;
     const imageResponse = await axios.get(fileDownloadUrl, { 
       responseType: 'arraybuffer',
       timeout: 30000 
     });
 
-    // 3. Сжимаем через sharp (режет входные токены в 4-5 раз!)
+    // 3. Сжимаем через sharp
     const compressedBuffer = await sharp(imageResponse.data)
       .resize(1024, 1024, { fit: 'inside', withoutEnlargement: true })
       .jpeg({ quality: 80 })
@@ -398,15 +404,14 @@ bot.on('photo', async (msg) => {
       return safeSendMessage(chatId, '🐗 Ошибка: Не задан GROQ_API_KEY!');
     }
 
-    // 4. Запрос к Groq с оптимизированными параметрами
+    // 4. Запрос к Groq
     const visionResponse = await axiosClient.post(
-      'https://api.groq.com/openai/v1/chat/completions?max_tokens=4096&reasoning_format=hidden',
-      'https://api.groq.com/openai/v1/chat/completions?max_tokens=4096',
-      'https://api.groq.com/openai/v1/chat/completions',
+      '[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)',
       {
         model: 'qwen/qwen3.6-27b',
+        reasoning_format: 'hidden',
         temperature: 0.1,
-        max_tokens: 2000,
+        max_tokens: 3500,
         messages: [
           {
             role: 'system',
@@ -659,6 +664,7 @@ bot.on('message', async (msg) => {
         '[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)',
         {
           model: 'llama-3.3-70b-versatile',
+          reasoning_format: 'hidden',
           messages: [
             {
               role: 'system',
@@ -795,5 +801,6 @@ process.on('unhandledRejection', (reason) => {
 });
 
 console.log('Бот "Кабан Финансист" успешно запущен и готов к деплою!');
+
 
 
