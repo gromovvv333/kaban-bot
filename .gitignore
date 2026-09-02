@@ -1,3 +1,5 @@
 node_modules/
 .env
 rates.json
+state.json
+.DS_Store
