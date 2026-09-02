@@ -1,4 +1,5 @@
-require('dotenv').config();
+// На Render переменные уже в process.env; dotenv не перезаписывает их (override: false).
+require('dotenv').config({ override: false });
 
 const http = require('http');
 const TelegramBot = require('node-telegram-bot-api');
@@ -14,22 +15,54 @@ function cleanEnvVar(val) {
   return String(val).trim().replace(/^["']|["']$/g, '');
 }
 
-const botToken = cleanEnvVar(process.env.TELEGRAM_BOT_TOKEN);
-const groqApiKey = cleanEnvVar(process.env.GROQ_API_KEY);
-const googleScriptUrl = cleanEnvVar(process.env.GOOGLE_SCRIPT_URL);
+function cleanBotToken(val) {
+  if (!val) return '';
+  let token = String(val).trim().replace(/^\uFEFF/, '');
+  token = token.replace(/^bot\s*/i, '').replace(/^token[:\s]*/i, '');
+  token = token.replace(/^["']|["']$/g, '').replace(/\s+/g, '');
+  return token;
+}
 
-function logMissingEnv() {
+function readEnvConfig() {
+  return {
+    botToken: cleanBotToken(process.env.TELEGRAM_BOT_TOKEN),
+    groqApiKey: cleanEnvVar(process.env.GROQ_API_KEY),
+    googleScriptUrl: cleanEnvVar(process.env.GOOGLE_SCRIPT_URL)
+  };
+}
+
+let { botToken, groqApiKey, googleScriptUrl } = readEnvConfig();
+let activeBotToken = '';
+
+const TOKEN_FORMAT = /^\d+:[A-Za-z0-9_-]{20,}$/;
+
+function logTokenDiagnostics(token) {
+  const botId = token.includes(':') ? token.split(':')[0] : '???';
+  console.log(`🔑 TELEGRAM_BOT_TOKEN: bot_id=${botId}, длина=${token.length}, Render=${!!process.env.RENDER}`);
+}
+
+function validateEnvConfig(config) {
   const missing = [];
-  if (!botToken) missing.push('TELEGRAM_BOT_TOKEN');
-  if (!groqApiKey) missing.push('GROQ_API_KEY');
-  if (!googleScriptUrl) missing.push('GOOGLE_SCRIPT_URL');
+  if (!config.botToken) missing.push('TELEGRAM_BOT_TOKEN');
+  if (!config.groqApiKey) missing.push('GROQ_API_KEY');
+  if (!config.googleScriptUrl) missing.push('GOOGLE_SCRIPT_URL');
 
-  if (missing.length === 0) return true;
+  if (missing.length > 0) {
+    console.error('❌ Не заданы переменные окружения:', missing.join(', '));
+    console.error('   Локально: добавь их в файл .env');
+    console.error('   Render: Dashboard → Environment → Environment Variables');
+    console.error('   Если есть Secret File (.env) — обнови и Environment Variable (она важнее).');
+    return false;
+  }
 
-  console.error('❌ Не заданы переменные окружения:', missing.join(', '));
-  console.error('   Локально: добавь их в файл .env');
-  console.error('   Render: Dashboard → Environment → Environment Variables');
-  return false;
+  if (!TOKEN_FORMAT.test(config.botToken)) {
+    console.error('❌ TELEGRAM_BOT_TOKEN имеет неверный формат.');
+    console.error('   Нужен вид: 123456789:ABCdefGHI... (только токен, без "bot" и кавычек).');
+    logTokenDiagnostics(config.botToken);
+    return false;
+  }
+
+  return true;
 }
 
 // Health-check для Render (поднимаем сразу, независимо от бота)
@@ -108,20 +141,7 @@ loadState();
 
 // ===================== Инициализация бота =====================
 
-const bot = new TelegramBot(botToken || 'missing-token', {
-  polling: false
-});
-
-bot.on('polling_error', (error) => {
-  const msg = error.message || String(error);
-  if (msg.includes('401') || msg.includes('Unauthorized')) {
-    console.error('❌ 401 Unauthorized — неверный TELEGRAM_BOT_TOKEN.');
-    console.error('   Обнови токен в Render → Environment (без кавычек и пробелов).');
-    bot.stopPolling().catch(() => {});
-    return;
-  }
-  console.error(`[Polling Error]: ${msg}`);
-});
+let bot = null;
 
 // Безопасная отправка сообщений
 async function safeSendMessage(chatId, text, options = {}, retries = 3) {
@@ -433,9 +453,22 @@ async function handleAnalytics(msg) {
   }
 }
 
-// ===================== Обработка фото (чеков) =====================
+function registerBotHandlers() {
+  bot.on('polling_error', (error) => {
+    const msg = error.message || String(error);
+    if (msg.includes('401') || msg.includes('Unauthorized')) {
+      console.error('❌ 401 Unauthorized при polling — Telegram отклонил токен.');
+      logTokenDiagnostics(activeBotToken);
+      console.error('   Проверь Environment Variables (не Secret File) на Render.');
+      bot.stopPolling().catch(() => {});
+      return;
+    }
+    console.error(`[Polling Error]: ${msg}`);
+  });
 
-bot.on('photo', async (msg) => {
+  // ===================== Обработка фото (чеков) =====================
+
+  bot.on('photo', async (msg) => {
   const chatId = msg.chat.id;
 
   try {
@@ -458,12 +491,12 @@ bot.on('photo', async (msg) => {
       return safeSendMessage(chatId, '🐗 Ошибка: Некорректный ID файла от Telegram.');
     }
 
-    if (!botToken) {
+    if (!activeBotToken) {
       return safeSendMessage(chatId, '🐗 Ошибка: Не задан TELEGRAM_BOT_TOKEN в переменных!');
     }
 
     // 1. Получаем путь к файлу напрямую через Telegram API
-    const getFileApiUrl = `https://api.telegram.org/bot${botToken}/getFile?file_id=${encodeURIComponent(fileId)}`;
+    const getFileApiUrl = `https://api.telegram.org/bot${activeBotToken}/getFile?file_id=${encodeURIComponent(fileId)}`;
 
     const fileRes = await fetch(getFileApiUrl);
     const fileData = await fileRes.json();
@@ -474,7 +507,7 @@ bot.on('photo', async (msg) => {
     }
 
     const cleanFilePath = String(fileData.result.file_path).trim();
-    const downloadUrl = `https://api.telegram.org/file/bot${botToken}/${cleanFilePath}`;
+    const downloadUrl = `https://api.telegram.org/file/bot${activeBotToken}/${cleanFilePath}`;
 
     // 2. Скачиваем файл
     const imageResponse = await axios.get(downloadUrl, {
@@ -564,11 +597,11 @@ bot.on('photo', async (msg) => {
     console.error('❌ Ошибка в блоке photo:', error);
     await safeSendMessage(chatId, `🐗 Ошибка обработки фото: ${errorDetails}`);
   }
-});
+  });
 
-// ===================== Инлайн-кнопки =====================
+  // ===================== Инлайн-кнопки =====================
 
-bot.on('callback_query', async (query) => {
+  bot.on('callback_query', async (query) => {
   const chatId = query.message.chat.id;
   const userId = query.from.id;
 
@@ -606,11 +639,11 @@ bot.on('callback_query', async (query) => {
 
     await handleDeleteExpense(chatId, userId, targetMsgId);
   }
-});
+  });
 
-// ===================== Обработчик текста =====================
+  // ===================== Обработчик текста =====================
 
-bot.on('message', async (msg) => {
+  bot.on('message', async (msg) => {
   if (!msg.text) return;
 
   const chatId = msg.chat.id;
@@ -709,28 +742,58 @@ bot.on('message', async (msg) => {
       await safeSendMessage(chatId, '🐗 Напиши трату в формате: `Такси 300`');
     }
   }
-});
+  });
+}
 
 // Защита от неожиданных сбоев
 process.on('uncaughtException', (err) => console.error('Uncaught Exception:', err.message));
 process.on('unhandledRejection', (err) => console.error('Unhandled Rejection:', err?.message || err));
 
+async function verifyTelegramToken(token) {
+  const { data } = await axios.get(`https://api.telegram.org/bot${token}/getMe`, { timeout: 15000 });
+  if (!data.ok) {
+    throw new Error(data.description || 'getMe failed');
+  }
+  return data.result;
+}
+
+async function clearTelegramWebhook(token) {
+  const { data } = await axios.get(`https://api.telegram.org/bot${token}/deleteWebhook`, {
+    params: { drop_pending_updates: false },
+    timeout: 15000
+  });
+  if (!data.ok) {
+    console.warn('⚠️ deleteWebhook:', data.description || 'unknown warning');
+  } else if (data.result) {
+    console.log('🔗 Webhook сброшен, включаем polling.');
+  }
+}
+
 async function startBot() {
-  if (!logMissingEnv()) return;
+  const config = readEnvConfig();
+  botToken = config.botToken;
+  groqApiKey = config.groqApiKey;
+  googleScriptUrl = config.googleScriptUrl;
+
+  if (!validateEnvConfig(config)) return;
+
+  logTokenDiagnostics(config.botToken);
 
   try {
-    const { data } = await axios.get(`https://api.telegram.org/bot${botToken}/getMe`, { timeout: 15000 });
-    if (!data.ok) {
-      console.error('❌ Telegram отклонил токен:', data.description || 'unknown error');
-      return;
-    }
+    const me = await verifyTelegramToken(config.botToken);
+    await clearTelegramWebhook(config.botToken);
+
+    activeBotToken = config.botToken;
+    bot = new TelegramBot(config.botToken, { polling: false });
+    registerBotHandlers();
 
     await bot.startPolling({ interval: 500, params: { timeout: 10 } });
-    console.log(`✅ Бот "Кабан Финансист" запущен: @${data.result.username}`);
+    console.log(`✅ Бот "Кабан Финансист" запущен: @${me.username} (id ${me.id})`);
   } catch (err) {
     if (err.response?.status === 401) {
-      console.error('❌ 401 Unauthorized — TELEGRAM_BOT_TOKEN неверный или устарел.');
-      console.error('   BotFather → /token → скопируй новый токен в Render Environment Variables.');
+      console.error('❌ 401 Unauthorized — Telegram не принял TELEGRAM_BOT_TOKEN.');
+      console.error('   На Render обнови именно Environment Variables (Key: TELEGRAM_BOT_TOKEN).');
+      console.error('   Secret File (.env) не перезаписывает переменные из панели.');
     } else {
       console.error('❌ Не удалось запустить бота:', err.response?.data?.description || err.message);
     }
