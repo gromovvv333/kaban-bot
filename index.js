@@ -244,7 +244,7 @@ function parseReceiptJSON(rawText) {
 
 const GROQ_CHAT_URL = 'https://api.groq.com/openai/v1/chat/completions';
 
-async function callGroq({ model, system, userContent, temperature, maxTokens, timeout = 20000, extra = {} }) {
+async function callGroq({ model, system, userContent, temperature, maxTokens, timeout = 20000, extra = {}, retries = 2 }) {
   if (!groqApiKey) {
     throw new Error('GROQ_API_KEY не задан в переменных окружения');
   }
@@ -257,25 +257,35 @@ async function callGroq({ model, system, userContent, temperature, maxTokens, ti
   if (temperature !== undefined) payload.temperature = temperature;
   if (maxTokens !== undefined) payload.max_tokens = maxTokens;
 
-  const response = await axios.post(GROQ_CHAT_URL, payload, {
-    headers: {
-      'Authorization': `Bearer ${groqApiKey}`,
-      'Content-Type': 'application/json'
-    },
-    timeout
-  });
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const response = await axios.post(GROQ_CHAT_URL, payload, {
+        headers: {
+          'Authorization': `Bearer ${groqApiKey}`,
+          'Content-Type': 'application/json'
+        },
+        timeout
+      });
 
-  const choice = response.data?.choices?.[0];
-  // Даже с reasoning_format: 'hidden' модель всё равно тратит токены на
-  // скрытые рассуждения — они просто не попадают в content. Если она
-  // "передумала" в рамках max_tokens, ответ обрывается пустым, а
-  // finish_reason будет 'length'. Логируем это явно, чтобы в логах Render
-  // сразу было видно причину, а не только "Пустой ответ от нейросети".
-  if (choice?.finish_reason === 'length' && !choice?.message?.content) {
-    console.warn(`⚠️ Groq (${model}) исчерпал max_tokens на скрытых рассуждениях, content пуст. Увеличь maxTokens или снизь reasoning_effort.`);
+      const choice = response.data?.choices?.[0];
+      if (choice?.finish_reason === 'length' && !choice?.message?.content) {
+        console.warn(`⚠️ Groq (${model}) исчерпал max_tokens на скрытых рассуждениях, content пуст. Увеличь maxTokens или снизь reasoning_effort.`);
+      }
+
+      return choice?.message?.content;
+    } catch (err) {
+      // 429 = упёрлись в TPM/RPM лимит free-тарифа. Groq обычно отдаёт
+      // Retry-After, а если нет — ждём с запасом и пробуем ещё раз, не
+      // падая в ошибку пользователю на ровном месте.
+      if (err.response?.status === 429 && attempt < retries) {
+        const retryAfterSec = Number(err.response.headers?.['retry-after']) || 2;
+        console.warn(`⚠️ Groq 429 (${model}), попытка ${attempt + 1}/${retries}, жду ${retryAfterSec}с...`);
+        await new Promise((res) => setTimeout(res, retryAfterSec * 1000));
+        continue;
+      }
+      throw err;
+    }
   }
-
-  return choice?.message?.content;
 }
 
 // ===================== Общие справочники =====================
@@ -595,12 +605,20 @@ function registerBotHandlers() {
     const rawContent = await callGroq({
       model: 'qwen/qwen3.6-27b',
       temperature: 0.1,
-      maxTokens: 6000, // было 4096 — на среднем/длинном чеке не хватало запаса поверх скрытых рассуждений
+      // На free-тарифе у qwen/qwen3.6-27b лимит 8000 ТОКЕНОВ В МИНУТУ, и
+      // Groq резервирует под запрос весь maxTokens ЗАРАНЕЕ, ещё до
+      // генерации ответа. Само фото уже "стоит" ~2000-3000 токенов
+      // (фиксированные 2048 за картинку + системный промпт), поэтому
+      // maxTokens здесь должен быть скромным, иначе 429 прилетает даже
+      // при полностью свободном лимите. С reasoning_effort: 'none'
+      // (см. ниже) реального текста в ответе немного — 2500 с большим
+      // запасом хватает на чек с кучей позиций.
+      maxTokens: 2500,
       timeout: 60000,
       // reasoning_effort: 'none' отключает режим "размышлений" у Qwen —
       // задача "распознай и переведи позиции с чека" не требует глубокого
-      // рассуждения, а скрытые рассуждения съедали весь лимит max_tokens
-      // на чеках с несколькими позициями, оставляя content пустым.
+      // рассуждения, а скрытые рассуждения съедали токены на чеках с
+      // несколькими позициями, оставляя content пустым.
       extra: { reasoning_format: 'hidden', reasoning_effort: 'none' },
       system: `Ты модуль распознавания чеков. Выдели ВСЕ товары и цены.
 ОБЯЗАТЕЛЬНО ПЕРЕВОДИ все названия товаров на РУССКИЙ ЯЗЫК (например: "Thịt heo" -> "Свинина", "Cà phê" -> "Кофе", "Water" -> "Вода", "Bánh mì" -> "Хлеб").
