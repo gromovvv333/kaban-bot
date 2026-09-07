@@ -265,7 +265,17 @@ async function callGroq({ model, system, userContent, temperature, maxTokens, ti
     timeout
   });
 
-  return response.data?.choices?.[0]?.message?.content;
+  const choice = response.data?.choices?.[0];
+  // Даже с reasoning_format: 'hidden' модель всё равно тратит токены на
+  // скрытые рассуждения — они просто не попадают в content. Если она
+  // "передумала" в рамках max_tokens, ответ обрывается пустым, а
+  // finish_reason будет 'length'. Логируем это явно, чтобы в логах Render
+  // сразу было видно причину, а не только "Пустой ответ от нейросети".
+  if (choice?.finish_reason === 'length' && !choice?.message?.content) {
+    console.warn(`⚠️ Groq (${model}) исчерпал max_tokens на скрытых рассуждениях, content пуст. Увеличь maxTokens или снизь reasoning_effort.`);
+  }
+
+  return choice?.message?.content;
 }
 
 // ===================== Общие справочники =====================
@@ -486,9 +496,9 @@ async function handleAnalytics(msg) {
 
     const rawAnswer = await callGroq({
       model: GROQ_TEXT_MODEL, // было: 'llama-3.3-70b-versatile' — отключена Groq 16.08.2026
-      maxTokens: 4096,
+      maxTokens: 6144, // было 4096 — с запасом, чтобы скрытые рассуждения не съели весь лимит на большой истории трат
       timeout: 30000,
-      extra: { reasoning_format: 'hidden' }, // не тратим токены/время на служебные рассуждения модели
+      extra: { reasoning_format: 'hidden' }, // здесь рассуждение оставляем как есть — для аналитики оно уместно, просто не показываем его
       system: `Ты — харизматичный финансовый аналитик "Кабан Финансист". Пользователь: "${kabanName}".
 История трат в JSON: ${JSON.stringify(historyData)}.
 
@@ -585,9 +595,13 @@ function registerBotHandlers() {
     const rawContent = await callGroq({
       model: 'qwen/qwen3.6-27b',
       temperature: 0.1,
-      maxTokens: 4096,
+      maxTokens: 6000, // было 4096 — на среднем/длинном чеке не хватало запаса поверх скрытых рассуждений
       timeout: 60000,
-      extra: { reasoning_format: 'hidden' },
+      // reasoning_effort: 'none' отключает режим "размышлений" у Qwen —
+      // задача "распознай и переведи позиции с чека" не требует глубокого
+      // рассуждения, а скрытые рассуждения съедали весь лимит max_tokens
+      // на чеках с несколькими позициями, оставляя content пустым.
+      extra: { reasoning_format: 'hidden', reasoning_effort: 'none' },
       system: `Ты модуль распознавания чеков. Выдели ВСЕ товары и цены.
 ОБЯЗАТЕЛЬНО ПЕРЕВОДИ все названия товаров на РУССКИЙ ЯЗЫК (например: "Thịt heo" -> "Свинина", "Cà phê" -> "Кофе", "Water" -> "Вода", "Bánh mì" -> "Хлеб").
 
@@ -756,7 +770,13 @@ function registerBotHandlers() {
       const rawContent = await callGroq({
         model: GROQ_TEXT_MODEL, // было: 'llama-3.3-70b-versatile' — отключена Groq 16.08.2026, отсюда и баг
         timeout: 20000,
-        extra: { reasoning_format: 'hidden' },
+        maxTokens: 2048,
+        // reasoning_effort: 'low' — GPT-OSS не поддерживает 'none', но
+        // 'low' минимизирует скрытые рассуждения. Простой разбор фразы
+        // вроде "пиво 400" не требует глубокого мышления, а на длинных
+        // сообщениях (несколько трат подряд) риск та же болезнь, что и с
+        // фото — рассуждения съедают весь лимит токенов.
+        extra: { reasoning_format: 'hidden', reasoning_effort: 'low' },
         system: `Разбери сообщение и верни СТРОГО JSON.
 {
   "intent": "add_expense" | "delete" | "analytics",
