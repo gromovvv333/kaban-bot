@@ -103,9 +103,6 @@ function saveRates() {
 loadRates();
 
 // ===================== Состояние пользователей (тоже персист) =====================
-// Раньше userCurrencies/userStates жили только в памяти и слетали при
-// каждом рестарте процесса (например, когда Render "усыпляет" бесплатный
-// сервис). Теперь выбранная валюта переживает рестарт.
 
 const STATE_FILE = path.join(__dirname, 'state.json');
 let userCurrencies = {};
@@ -163,15 +160,52 @@ async function safeSendMessage(chatId, text, options = {}, retries = 3) {
 }
 
 // ===================== Парсер JSON от нейросетей =====================
+// ВАЖНО: проверь этот блок в своём реальном файле. В коде, который ты
+// прислал в чат, здесь стояло:
+//   if (out.includes('')) { out = out.split('').pop(); }
+// Пустая строка '' входит в ЛЮБУЮ строку, поэтому эта ветка срабатывала
+// ВСЕГДА, а out.split('').pop() разбивал ответ модели по каждому символу
+// и оставлял только последний символ — то есть весь JSON от нейросети
+// обрезался до одной буквы. Похоже, при копировании в чат теги <think> и
+// </think> (как обычный текст) были съедены разметкой мессенджера. Если в
+// твоём исходнике реально стоит out.includes('') — это отдельный
+// серьёзный баг, вот рабочая версия с явными тегами:
+function stripThinkTags(text) {
+  let out = (text || '').trim();
+  if (out.includes('<think>')) {
+    out = out.split('<think>').pop();
+  }
+  out = out
+    .replace(/[\s\S]*?<\/think>/gi, '')
+    .replace(/[\s\S]*?<\/redacted_thinking>/gi, '')
+    .trim();
+  return out;
+}
+
+// Вытаскивает полностью сформированные позиции из обрезанного JSON (длинные чеки).
+function salvageReceiptItems(rawText) {
+  const text = stripThinkTags(rawText);
+  const items = [];
+  const re = /\{\s*"name"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,\s*"price"\s*:\s*(\d+(?:\.\d+)?)\s*,\s*"category"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,\s*"type"\s*:\s*"((?:[^"\\]|\\.)*)"\s*\}/g;
+  let match;
+  while ((match = re.exec(text)) !== null) {
+    items.push({
+      name: match[1].replace(/\\"/g, '"'),
+      price: Number(match[2]),
+      category: match[3],
+      type: match[4]
+    });
+  }
+  return items.length > 0 ? { items } : null;
+}
 
 function cleanAndParseJSON(rawText) {
-  let text = (rawText || '').trim();
-
-  if (text.includes('</think>')) {
-    text = text.split('</think>')[1];
-  }
-  text = text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+  let text = stripThinkTags(rawText);
   text = text.replace(/^```json\s*/i, '').replace(/^```\s*/, '').replace(/\s*```$/, '').trim();
+
+  if (!text) {
+    throw new Error('Пустой ответ от нейросети');
+  }
 
   const firstBrace = text.indexOf('{');
   const lastBrace = text.lastIndexOf('}');
@@ -183,7 +217,7 @@ function cleanAndParseJSON(rawText) {
     return JSON.parse(text);
   } catch (err) {
     console.log('⚠️ Применяется доп. очистка кавычек и переносов...');
-    let sanitized = text
+    const sanitized = text
       .replace(/\r?\n/g, ' ')
       .replace(/([{,]\s*"[a-zA-Z0-9_]+"\s*:\s*)"([^"]*)"/g, (match, p1, p2) => {
         return p1 + '"' + p2.replace(/"/g, "'") + '"';
@@ -193,12 +227,20 @@ function cleanAndParseJSON(rawText) {
   }
 }
 
+function parseReceiptJSON(rawText) {
+  try {
+    return cleanAndParseJSON(rawText);
+  } catch (err) {
+    const salvaged = salvageReceiptItems(rawText);
+    if (salvaged) {
+      console.log(`✅ Восстановлено ${salvaged.items.length} позиций из обрезанного ответа Groq`);
+      return salvaged;
+    }
+    throw err;
+  }
+}
+
 // ===================== Единая точка вызова Groq =====================
-// Раньше было 3 почти одинаковых axios.post блока с ручным дублированием
-// заголовков/URL — в двух из них URL был битым (markdown-ссылка вида
-// "[https://...](https://...)" вместо чистого https://...), из-за чего
-// аналитика и разбор свободного текста падали с ошибкой. Теперь URL и
-// логика запроса в одном месте.
 
 const GROQ_CHAT_URL = 'https://api.groq.com/openai/v1/chat/completions';
 
@@ -227,10 +269,6 @@ async function callGroq({ model, system, userContent, temperature, maxTokens, ti
 }
 
 // ===================== Общие справочники =====================
-// Раньше список категорий был прописан только в промпте распознавания
-// чеков, а в промпте разбора свободного текста его не было — из-за этого
-// при ручном вводе трата могла получить категорию, которой нет в
-// выпадающем списке таблицы. Теперь один источник правды.
 
 const CATEGORIES = [
   'Продукты', 'Бухло', 'Вкусняшки кабаньи', 'Транспорт',
@@ -239,9 +277,26 @@ const CATEGORIES = [
 ];
 const EXPENSE_TYPES = ['Личный', 'Общий'];
 
+// ⚠️ ГЛАВНЫЙ ФИКС ⚠️
+// llama-3.3-70b-versatile была объявлена deprecated Groq 17 июня 2026 и
+// ПОЛНОСТЬЮ ОТКЛЮЧЕНА 16 августа 2026 — все запросы к ней падают с
+// ошибкой model_decommissioned. Именно поэтому текстовые траты
+// ("пиво 400") и аналитика перестали работать: callGroq кидал ошибку,
+// она ловилась в catch, и бот просто отвечал "напиши в формате...", не
+// заводя трату. Фото при этом продолжали работать, т.к. используют
+// другую модель (qwen/qwen3.6-27b), которую Groq не трогала.
+//
+// Модель: openai/gpt-oss-20b — лёгкая (быстрее и "дешевле" по токенам,
+// чем 120b), это официальная рекомендованная Groq замена для другой
+// снятой модели (llama-3.1-8b-instant), и её более чем достаточно для
+// простой задачи "вытащи сумму/категорию из короткой фразы". Тоже
+// бесплатный тариф, как и всё остальное в проекте.
+// Вынесено в константу, чтобы при следующем депрекейшене менять модель
+// в одном месте.
+const GROQ_TEXT_MODEL = 'openai/gpt-oss-20b';
+
 // Слова, для которых нужно сработать "фикс" завышенной цены с чека
 // (модель иногда путает разряды и возвращает 1 500 000 вместо 15 000).
-// Проверяем ЦЕЛЫЕ слова, а не подстроки — раньше "вод" матчил и "водку".
 const SMALL_ITEM_WORDS = ['вода', 'кофе', 'чай', 'чипсы', 'пиво'];
 
 function isSmallItem(name) {
@@ -330,9 +385,6 @@ async function processExpense(msg, data) {
 
   const rawAmount = Number(data.amount);
 
-  // Раньше NaN/отрицательные/нулевые суммы молча превращались в 0 и всё
-  // равно летели в таблицу. Теперь такие траты отбрасываются с понятным
-  // сообщением.
   if (!Number.isFinite(rawAmount) || rawAmount <= 0) {
     await safeSendMessage(
       chatId,
@@ -432,9 +484,11 @@ async function handleAnalytics(msg) {
     const tableDataResponse = await axios.get(googleScriptUrl, { timeout: 15000 });
     const historyData = tableDataResponse.data;
 
-    const aiAnalyticsAnswer = await callGroq({
-      model: 'llama-3.3-70b-versatile',
+    const rawAnswer = await callGroq({
+      model: GROQ_TEXT_MODEL, // было: 'llama-3.3-70b-versatile' — отключена Groq 16.08.2026
       maxTokens: 4096,
+      timeout: 30000,
+      extra: { reasoning_format: 'hidden' }, // не тратим токены/время на служебные рассуждения модели
       system: `Ты — харизматичный финансовый аналитик "Кабан Финансист". Пользователь: "${kabanName}".
 История трат в JSON: ${JSON.stringify(historyData)}.
 
@@ -442,9 +496,10 @@ async function handleAnalytics(msg) {
 1. НИКОГДА НЕ ИСПОЛЬЗУЙ РЕШЁТКИ (#, ##) для заголовков!
 2. Для заголовков используй ЭМОДЗИ + ЖИРНЫЙ ТЕКСТ.
 3. Пиши с кабанским юмором.`,
-      userContent: msg.text || 'Покажи аналитику трат',
-      timeout: 30000
+      userContent: msg.text || 'Покажи аналитику трат'
     });
+
+    const aiAnalyticsAnswer = stripThinkTags(rawAnswer);
 
     return await safeSendMessage(chatId, aiAnalyticsAnswer, { parse_mode: 'Markdown' });
   } catch (error) {
@@ -563,7 +618,7 @@ function registerBotHandlers() {
       ]
     });
 
-    let data = cleanAndParseJSON(rawContent);
+    let data = parseReceiptJSON(rawContent); // было cleanAndParseJSON — теряли фолбэк на "спасение" обрезанного ответа
 
     if (data && data.items && Array.isArray(data.items) && data.items.length > 0) {
       let addedCount = 0;
@@ -699,8 +754,9 @@ function registerBotHandlers() {
   if (!text.startsWith('/')) {
     try {
       const rawContent = await callGroq({
-        model: 'llama-3.3-70b-versatile',
-        timeout: 15000,
+        model: GROQ_TEXT_MODEL, // было: 'llama-3.3-70b-versatile' — отключена Groq 16.08.2026, отсюда и баг
+        timeout: 20000,
+        extra: { reasoning_format: 'hidden' },
         system: `Разбери сообщение и верни СТРОГО JSON.
 {
   "intent": "add_expense" | "delete" | "analytics",
@@ -726,6 +782,10 @@ function registerBotHandlers() {
 
       let expensesList = Array.isArray(parsed.expenses) ? parsed.expenses : [];
 
+      if (expensesList.length === 0) {
+        return safeSendMessage(chatId, '🐗 Не понял, что за трата. Напиши в формате: `Пиво 400`', { parse_mode: 'Markdown' });
+      }
+
       for (const item of expensesList) {
         if (item.amount) {
           await processExpense(msg, {
@@ -739,7 +799,7 @@ function registerBotHandlers() {
 
     } catch (error) {
       console.error('Ошибка разбора текста:', error.message);
-      await safeSendMessage(chatId, '🐗 Напиши трату в формате: `Такси 300`');
+      await safeSendMessage(chatId, '🐗 Напиши трату в формате: `Такси 300`', { parse_mode: 'Markdown' });
     }
   }
   });
